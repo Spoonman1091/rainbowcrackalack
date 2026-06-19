@@ -1185,7 +1185,10 @@ static size_t autotune_precompute_gws(thread_args *args) {
 
   charset_len = (strcmp(args->charset_name, "byte") == 0) ?
                 256 : (unsigned int)(strlen(args->charset) + 1);
-  bench_chain_len = (cl_ulong)args->chain_len;
+  /* Use a short chain length for benchmarking — relative GWS throughput is
+   * independent of chain depth, so 200 steps is enough while keeping each
+   * kernel launch under a millisecond instead of seconds. */
+  bench_chain_len = (cl_ulong)(args->chain_len < 200 ? args->chain_len : 200);
 
   CLCREATEARG(0, hash_type_buffer, CL_RO, args->hash_type, sizeof(cl_uint));
   CLCREATEARG_ARRAY(1, hash_buffer, CL_RO, hash_binary, hash_binary_len);

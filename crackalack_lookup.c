@@ -95,6 +95,12 @@ typedef struct {
   cl_command_queue queue;
   cl_uint num_work_units;
   size_t tuned_gws;
+  /* Cached false alarm kernel — reused across tables to avoid repeated JIT
+   * compilation.  Populated on first use and written back by table_worker_thread. */
+  cl_context fa_context;
+  cl_command_queue fa_queue;
+  cl_program fa_program;
+  cl_kernel fa_kernel;
 } gpu_dev;
 
 
@@ -965,23 +971,34 @@ void *host_thread_false_alarm(void *ptr) {
     }
   }
 
-  /* Load the kernel. */
-  gpu->context = CLCREATECONTEXT(context_callback, &(gpu->device));
-  gpu->queue = CLCREATEQUEUE(gpu->context, gpu->device);
-  load_kernel(gpu->context, 1, &(gpu->device), kernel_path, kernel_name, &(gpu->program), &(gpu->kernel), args->hash_type);
+  /* Load the false alarm kernel, reusing cached objects across tables to avoid
+   * repeated JIT compilation.  The cache is populated on first use and kept
+   * alive via write-back in table_worker_thread. */
+  if (gpu->fa_context == NULL) {
+    gpu->fa_context = CLCREATECONTEXT(context_callback, &(gpu->device));
+    gpu->fa_queue   = CLCREATEQUEUE(gpu->fa_context, gpu->device);
+    load_kernel(gpu->fa_context, 1, &(gpu->device), kernel_path, kernel_name,
+                &(gpu->fa_program), &(gpu->fa_kernel), args->hash_type);
+  }
+  gpu->context = gpu->fa_context;
+  gpu->queue   = gpu->fa_queue;
+  gpu->kernel  = gpu->fa_kernel;
+  gpu->program = gpu->fa_program;
 
   /* These variables are set so the CLCREATEARG* macros work correctly. */
   context = gpu->context;
-  queue = gpu->queue;
-  kernel = gpu->kernel;
+  queue   = gpu->queue;
+  kernel  = gpu->kernel;
 
   if ((rc_clGetKernelWorkGroupInfo(kernel, gpu->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &kernel_work_group_size, NULL) != CL_SUCCESS) || \
       (rc_clGetKernelWorkGroupInfo(kernel, gpu->device, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(size_t), &kernel_preferred_work_group_size_multiple, NULL) != CL_SUCCESS)) {
     fprintf(stderr, "Failed to get preferred work group size!\n");
-    CLRELEASEKERNEL(gpu->kernel);
-    CLRELEASEPROGRAM(gpu->program);
-    CLRELEASEQUEUE(gpu->queue);
-    CLRELEASECONTEXT(gpu->context);
+    CLRELEASEKERNEL(gpu->fa_kernel);
+    CLRELEASEPROGRAM(gpu->fa_program);
+    CLRELEASEQUEUE(gpu->fa_queue);
+    CLRELEASECONTEXT(gpu->fa_context);
+    gpu->kernel = NULL; gpu->program = NULL;
+    gpu->queue  = NULL; gpu->context = NULL;
     pthread_exit(NULL);
     return NULL;
   }
@@ -1091,10 +1108,8 @@ void *host_thread_false_alarm(void *ptr) {
   CLFREEBUFFER(hash_base_indices_buffer);
   CLFREEBUFFER(output_block_buffer);
 
-  CLRELEASEKERNEL(gpu->kernel);
-  CLRELEASEPROGRAM(gpu->program);
-  CLRELEASEQUEUE(gpu->queue);
-  CLRELEASECONTEXT(gpu->context);
+  /* fa_context/fa_queue/fa_program/fa_kernel are kept alive for reuse across
+   * tables; only the per-call data buffers above are freed here. */
 
   pthread_exit(NULL);
   return NULL;
@@ -2243,6 +2258,13 @@ void *table_worker_thread(void *ptr) {
     fa_args = wargs->all_device_args[dev_slot];
 
     check_false_alarms_worker(wargs->ppi_head, scratch, &fa_args);
+
+    /* Write back the FA kernel cache so the next use of this device slot
+     * reuses the compiled kernel instead of recompiling. */
+    wargs->all_device_args[dev_slot].gpu.fa_context = fa_args.gpu.fa_context;
+    wargs->all_device_args[dev_slot].gpu.fa_queue   = fa_args.gpu.fa_queue;
+    wargs->all_device_args[dev_slot].gpu.fa_program = fa_args.gpu.fa_program;
+    wargs->all_device_args[dev_slot].gpu.fa_kernel  = fa_args.gpu.fa_kernel;
 
     /* Return the GPU device slot. */
     pthread_mutex_lock(&device_pool_mutex);

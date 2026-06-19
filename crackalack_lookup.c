@@ -1107,10 +1107,6 @@ void *host_thread_false_alarm(void *ptr) {
 static size_t autotune_precompute_gws(thread_args *args) {
   gpu_dev *gpu = &(args->gpu);
   char *kernel_path = PRECOMPUTE_KERNEL_PATH, *kernel_name = "precompute";
-  cl_context context = NULL;
-  cl_command_queue queue = NULL;
-  cl_program program = NULL;
-  cl_kernel kernel = NULL;
   cl_mem hash_type_buffer = NULL, hash_buffer = NULL, hash_len_buffer = NULL;
   cl_mem charset_buffer = NULL, plen_min_buffer = NULL, plen_max_buffer = NULL;
   cl_mem table_index_buffer = NULL, chain_len_buffer = NULL, dev_num_buffer = NULL;
@@ -1124,6 +1120,10 @@ static size_t autotune_precompute_gws(thread_args *args) {
   unsigned char hash_binary[32] = {0};
   cl_uint hash_binary_len = 0, bench_dev = 0, bench_total = 1, bench_scaler = 0;
   cl_ulong bench_chain_len = 0;
+  /* Local aliases required by CLCREATEARG / CLRUNKERNEL macros. */
+  cl_context context = NULL;
+  cl_command_queue queue = NULL;
+  cl_kernel kernel = NULL;
 
   if (args->hash == NULL)
     return 0;
@@ -1144,10 +1144,15 @@ static size_t autotune_precompute_gws(thread_args *args) {
     kernel_name = "precompute_ntlm9";
   }
 
-  context = CLCREATECONTEXT(context_callback, &(gpu->device));
-  queue = CLCREATEQUEUE(context, gpu->device);
-  load_kernel(context, 1, &(gpu->device), kernel_path, kernel_name,
-              &program, &kernel, args->hash_type);
+  /* Compile the kernel and store it in gpu so host_thread_precompute can
+   * reuse it, avoiding a second expensive JIT compilation. */
+  gpu->context = CLCREATECONTEXT(context_callback, &(gpu->device));
+  gpu->queue   = CLCREATEQUEUE(gpu->context, gpu->device);
+  load_kernel(gpu->context, 1, &(gpu->device), kernel_path, kernel_name,
+              &(gpu->program), &(gpu->kernel), args->hash_type);
+  context = gpu->context;
+  queue   = gpu->queue;
+  kernel  = gpu->kernel;
 
   if (rc_clGetKernelWorkGroupInfo(kernel, gpu->device, CL_KERNEL_WORK_GROUP_SIZE,
                                   sizeof(size_t), &wg, NULL) != CL_SUCCESS) {
@@ -1233,6 +1238,12 @@ static size_t autotune_precompute_gws(thread_args *args) {
     }
   }
 
+  printf("  GWS autotune GPU #%u: selected %zu.\n", gpu->device_number, best_gws);
+  fflush(stdout);
+
+done:
+  /* context/program/queue/kernel are kept in gpu for host_thread_precompute
+   * to reuse; only the temporary benchmark buffers are freed here. */
   CLFREEBUFFER(hash_type_buffer);
   CLFREEBUFFER(hash_buffer);
   CLFREEBUFFER(hash_len_buffer);
@@ -1247,15 +1258,6 @@ static size_t autotune_precompute_gws(thread_args *args) {
   CLFREEBUFFER(out_buffer);
   free(output_block);
   output_block = NULL;
-
-  printf("  GWS autotune GPU #%u: selected %zu.\n", gpu->device_number, best_gws);
-  fflush(stdout);
-
-done:
-  CLRELEASEKERNEL(kernel);
-  CLRELEASEPROGRAM(program);
-  CLRELEASEQUEUE(queue);
-  CLRELEASECONTEXT(context);
   return best_gws;
 }
 
@@ -1309,10 +1311,13 @@ void *host_thread_precompute(void *ptr) {
     }
   }
 
-  /* Load the kernel. */
-  gpu->context = CLCREATECONTEXT(context_callback, &(gpu->device));
-  gpu->queue = CLCREATEQUEUE(gpu->context, gpu->device);
-  load_kernel(gpu->context, 1, &(gpu->device), kernel_path, kernel_name, &(gpu->program), &(gpu->kernel), args->hash_type);
+  /* Load the kernel, reusing the already-compiled objects from autotune if
+   * available to avoid a second expensive JIT compilation. */
+  if (gpu->context == NULL) {
+    gpu->context = CLCREATECONTEXT(context_callback, &(gpu->device));
+    gpu->queue = CLCREATEQUEUE(gpu->context, gpu->device);
+    load_kernel(gpu->context, 1, &(gpu->device), kernel_path, kernel_name, &(gpu->program), &(gpu->kernel), args->hash_type);
+  }
 
   /* These variables are set so the CLCREATEARG* macros work correctly. */
   context = gpu->context;

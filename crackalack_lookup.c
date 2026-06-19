@@ -2315,10 +2315,11 @@ void search_tables(unsigned int total_tables, precomputed_and_potential_indices 
   unsigned int bs_threads = num_cores / W;
   if (bs_threads < 1) bs_threads = 1;
 
-  /* Buffer one table per GPU plus one staged for binary search.  The preloader is
-   * single-threaded so disk reads are already serialized; a deeper queue would
-   * just hold extra large files in RAM for no throughput benefit. */
-  max_preload_num = num_devices + 1;
+  /* Keep one table per worker plus one spare in the preload buffer so every
+   * worker can immediately start BS after finishing an FA check.  A smaller
+   * buffer (e.g. num_devices+1) starves the GPU queue: workers stall waiting
+   * for the preloader, leaving GPUs idle between jobs. */
+  max_preload_num = W + 1;
 
   /* Populate the device pool with all device indices. */
   pthread_mutex_lock(&device_pool_mutex);

@@ -94,6 +94,7 @@ typedef struct {
   cl_kernel kernel;
   cl_command_queue queue;
   cl_uint num_work_units;
+  size_t tuned_gws;
 } gpu_dev;
 
 
@@ -125,8 +126,24 @@ typedef struct {
   cl_ulong *hash_base_indices;
 
   gpu_dev gpu;
+  int use_barrier;
 } thread_args;
 
+
+/* Per-ppi-node scratch buffer owned by one worker during a single table lookup. */
+typedef struct {
+  cl_ulong *potential_start_indices;
+  unsigned int *potential_start_index_positions;
+  unsigned int num_potential_start_indices;
+  unsigned int potential_start_indices_size;
+} ppi_scratch_entry;
+
+/* Per-worker scratch: one entry per ppi node, plus a mutex for intra-worker concurrency. */
+typedef struct {
+  ppi_scratch_entry *entries;
+  unsigned int num_entries;
+  pthread_mutex_t lock;
+} worker_scratch;
 
 /* Struct to pass to binary search threads. */
 typedef struct {
@@ -135,6 +152,7 @@ typedef struct {
   precomputed_and_potential_indices *ppi_head;
   unsigned int thread_number;
   unsigned int total_threads;
+  worker_scratch *scratch;
 } search_thread_args;
 
 
@@ -152,6 +170,16 @@ typedef struct {
 } preloading_thread_args;
 
 
+/* Args for one worker in the parallel table-search pool. */
+typedef struct {
+  precomputed_and_potential_indices *ppi_head;
+  thread_args *all_device_args;
+  unsigned int num_devices;
+  unsigned int bs_threads;
+  unsigned int worker_id;
+} worker_thread_args;
+
+
 unsigned int count_tables(char *dir);
 void find_rt_params(char *dir, rt_parameters *rt_params);
 void free_loaded_hashes(char **usernames, char **hashes);
@@ -161,6 +189,11 @@ void print_eta_precompute();
 cl_ulong *search_precompute_cache(char *index_data, unsigned int *num_indices, char *filename, unsigned int filename_size);
 void search_tables(unsigned int total_tables, precomputed_and_potential_indices *ppi, thread_args *args);
 void save_cracked_hash(precomputed_and_potential_indices *ppi, unsigned int hash_type);
+void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, worker_scratch *scratch, thread_args *fa_args);
+void *table_worker_thread(void *ptr);
+worker_scratch *alloc_worker_scratch(precomputed_and_potential_indices *ppi_head);
+void free_worker_scratch(worker_scratch *scratch);
+void clear_worker_scratch(worker_scratch *scratch);
 
 
 /* The path of the pot file to store cracked hashes in.  This can be overridden by
@@ -244,9 +277,8 @@ unsigned int num_hashes_precomputed = 0;
 unsigned int num_hashes_precomputed_total = 0;
 
 
-/* The total number of tables to preload in memory while binary searching and false
- * alarm checking is done by the main thread. */
-#define MAX_PRELOAD_NUM 2
+/* The total number of tables to preload in memory; set to W+1 in search_tables(). */
+unsigned int max_preload_num = 2;
 
 #define LOCK_PPI() \
   if (pthread_mutex_lock(&ppi_mutex)) { perror("Failed to lock mutex"); exit(-1); }
@@ -255,42 +287,92 @@ unsigned int num_hashes_precomputed_total = 0;
   if (pthread_mutex_unlock(&ppi_mutex)) { perror("Failed to unlock mutex"); exit(-1); }
 
 
-/* Adds a potential start index (and position within the chain) to check for false
- * alarms. */
-void add_potential_start_index_and_position(precomputed_and_potential_indices *ppi, cl_ulong start, unsigned int position) {
-  #define POTENTIAL_START_INDICES_INITIAL_SIZE 16
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t potfile_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-  LOCK_PPI();
+/* Device pool: stack of available device indices for worker false-alarm checks. */
+pthread_mutex_t device_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t device_pool_cond = PTHREAD_COND_INITIALIZER;
+unsigned int device_pool_slots[MAX_NUM_DEVICES];
+unsigned int device_pool_count = 0;
 
-  /* Initialize the potential_start_indices buffer if it isn't already. */
-  if (ppi->potential_start_indices == NULL) {
-    ppi->potential_start_indices = calloc(POTENTIAL_START_INDICES_INITIAL_SIZE, sizeof(cl_ulong));
-    ppi->potential_start_index_positions = calloc(POTENTIAL_START_INDICES_INITIAL_SIZE, sizeof(cl_ulong));
-    if ((ppi->potential_start_indices == NULL) || (ppi->potential_start_index_positions == NULL)) {
-      fprintf(stderr, "Failed to initialize potential_start_indices / potential_start_index_positions buffer.\n");
-      exit(-1);
+unsigned int all_cracked = 0;
+unsigned int stop_preloading = 0;
+
+
+worker_scratch *alloc_worker_scratch(precomputed_and_potential_indices *ppi_head) {
+  worker_scratch *scratch = NULL;
+  precomputed_and_potential_indices *ppi_cur = ppi_head;
+  unsigned int count = 0;
+
+  while (ppi_cur != NULL) { count++; ppi_cur = ppi_cur->next; }
+
+  scratch = calloc(1, sizeof(worker_scratch));
+  if (scratch == NULL) { fprintf(stderr, "Failed to alloc worker_scratch.\n"); exit(-1); }
+
+  scratch->entries = calloc(count, sizeof(ppi_scratch_entry));
+  if (scratch->entries == NULL) { fprintf(stderr, "Failed to alloc scratch entries.\n"); exit(-1); }
+
+  scratch->num_entries = count;
+  pthread_mutex_init(&scratch->lock, NULL);
+  return scratch;
+}
+
+
+void free_worker_scratch(worker_scratch *scratch) {
+  unsigned int i = 0;
+  for (i = 0; i < scratch->num_entries; i++) {
+    FREE(scratch->entries[i].potential_start_indices);
+    FREE(scratch->entries[i].potential_start_index_positions);
+  }
+  FREE(scratch->entries);
+  pthread_mutex_destroy(&scratch->lock);
+  FREE(scratch);
+}
+
+
+void clear_worker_scratch(worker_scratch *scratch) {
+  unsigned int i = 0;
+  for (i = 0; i < scratch->num_entries; i++) {
+    FREE(scratch->entries[i].potential_start_indices);
+    FREE(scratch->entries[i].potential_start_index_positions);
+    scratch->entries[i].num_potential_start_indices = 0;
+    scratch->entries[i].potential_start_indices_size = 0;
+  }
+}
+
+
+void scratch_add_match(worker_scratch *scratch, unsigned int ppi_idx, cl_ulong start, unsigned int position) {
+  #define SCRATCH_INITIAL_SIZE 16
+  ppi_scratch_entry *e = NULL;
+
+  pthread_mutex_lock(&scratch->lock);
+  e = &scratch->entries[ppi_idx];
+
+  if (e->potential_start_indices == NULL) {
+    e->potential_start_indices = calloc(SCRATCH_INITIAL_SIZE, sizeof(cl_ulong));
+    e->potential_start_index_positions = calloc(SCRATCH_INITIAL_SIZE, sizeof(unsigned int));
+    if ((e->potential_start_indices == NULL) || (e->potential_start_index_positions == NULL)) {
+      fprintf(stderr, "Failed to init scratch entry buffers.\n"); exit(-1);
     }
-    ppi->potential_start_indices_size = POTENTIAL_START_INDICES_INITIAL_SIZE;
+    e->potential_start_indices_size = SCRATCH_INITIAL_SIZE;
   }
 
-  /* If its time to re-size the array... */
-  if (ppi->num_potential_start_indices == ppi->potential_start_indices_size) {
-    unsigned int new_size_in_ulongs = ppi->potential_start_indices_size * 2;
-
-    /*printf("Resizing array from %u to %u.\n", ppi->potential_start_indices_size, new_size_in_ulongs);*/
-    ppi->potential_start_indices = recalloc(ppi->potential_start_indices, new_size_in_ulongs * sizeof(cl_ulong), ppi->potential_start_indices_size * sizeof(cl_ulong));
-    ppi->potential_start_index_positions = recalloc(ppi->potential_start_index_positions, new_size_in_ulongs * sizeof(cl_ulong), ppi->potential_start_indices_size * sizeof(cl_ulong));
-    if ((ppi->potential_start_indices == NULL) || (ppi->potential_start_index_positions == NULL)) {
-      fprintf(stderr, "Failed to re-allocate potential_start_indices/potential_start_index_positions buffer to %u.\n", new_size_in_ulongs);
-      exit(-1);
+  if (e->num_potential_start_indices == e->potential_start_indices_size) {
+    unsigned int new_size = e->potential_start_indices_size * 2;
+    e->potential_start_indices = recalloc(e->potential_start_indices, new_size * sizeof(cl_ulong), e->potential_start_indices_size * sizeof(cl_ulong));
+    e->potential_start_index_positions = recalloc(e->potential_start_index_positions, new_size * sizeof(unsigned int), e->potential_start_indices_size * sizeof(unsigned int));
+    if ((e->potential_start_indices == NULL) || (e->potential_start_index_positions == NULL)) {
+      fprintf(stderr, "Failed to resize scratch entry buffers.\n"); exit(-1);
     }
-    ppi->potential_start_indices_size = new_size_in_ulongs;
+    e->potential_start_indices_size = new_size;
   }
-  ppi->potential_start_indices[ppi->num_potential_start_indices] = start;
-  ppi->potential_start_index_positions[ppi->num_potential_start_indices] = position;
-  ppi->num_potential_start_indices++;
 
-  UNLOCK_PPI();
+  e->potential_start_indices[e->num_potential_start_indices] = start;
+  e->potential_start_index_positions[e->num_potential_start_indices] = position;
+  e->num_potential_start_indices++;
+
+  pthread_mutex_unlock(&scratch->lock);
 }
 
 
@@ -475,6 +557,163 @@ void check_false_alarms(precomputed_and_potential_indices *ppi, thread_args *arg
   FREE(ppi_refs);
   FREE(args->results);
   args->num_results = 0;
+}
+
+
+/* Single-device false alarm check for one worker in the parallel pool.
+ * Reads match candidates from scratch (not from ppi nodes), runs them on
+ * one GPU device, writes cracked plaintexts back to ppi nodes under ppi_mutex,
+ * and writes pot-file entries under potfile_mutex. */
+void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, worker_scratch *scratch, thread_args *fa_args) {
+  pthread_t fa_thread = {0};
+  char time_str[128] = {0};
+  struct timespec start_time = {0};
+  cl_ulong plaintext_space_up_to_index[MAX_PLAINTEXT_LEN] = {0};
+  cl_ulong *potential_start_indices = NULL, *hash_base_indices = NULL;
+  unsigned int *potential_start_index_positions = NULL;
+  precomputed_and_potential_indices **ppi_refs = NULL;
+  precomputed_and_potential_indices *ppi_cur = NULL;
+  unsigned int num_potential_start_indices = 0, i = 0, j = 0, ppi_idx = 0;
+  cl_ulong plaintext_space_total = 0;
+  double time_delta = 0.0;
+  int charset_len = 0;
+
+  if (strcmp(fa_args->charset_name, "byte") == 0)
+    charset_len = 256;
+  else
+    charset_len = strlen(fa_args->charset) + 1;
+
+  plaintext_space_total = fill_plaintext_space_table(charset_len, fa_args->plaintext_len_min, fa_args->plaintext_len_max, plaintext_space_up_to_index);
+
+  /* Count total potential start indices across all scratch entries. */
+  for (ppi_idx = 0; ppi_idx < scratch->num_entries; ppi_idx++)
+    num_potential_start_indices += scratch->entries[ppi_idx].num_potential_start_indices;
+
+  if (num_potential_start_indices == 0)
+    return;
+
+  printf("  Checking %u potential matches...\n", num_potential_start_indices);  fflush(stdout);
+
+  pthread_mutex_lock(&stats_mutex);
+  num_falsealarms += num_potential_start_indices;
+  pthread_mutex_unlock(&stats_mutex);
+
+  potential_start_indices = calloc(num_potential_start_indices, sizeof(cl_ulong));
+  potential_start_index_positions = calloc(num_potential_start_indices, sizeof(unsigned int));
+  hash_base_indices = calloc(num_potential_start_indices, sizeof(cl_ulong));
+  ppi_refs = calloc(num_potential_start_indices, sizeof(precomputed_and_potential_indices *));
+  if ((potential_start_indices == NULL) || (potential_start_index_positions == NULL) || (hash_base_indices == NULL) || (ppi_refs == NULL)) {
+    fprintf(stderr, "Error allocating false alarm buffers.\n"); exit(-1);
+  }
+
+  /* Flatten scratch entries into contiguous arrays, one entry per ppi node. */
+  ppi_cur = ppi_head; ppi_idx = 0; j = 0;
+  while (ppi_cur != NULL) {
+    if (ppi_cur->plaintext == NULL) {
+      unsigned char hash[MAX_HASH_OUTPUT_LEN] = {0};
+      unsigned int hash_len = hex_to_bytes(ppi_cur->hash, sizeof(hash), hash);
+      cl_ulong hash_base_index = hash_to_index(hash, hash_len, fa_args->reduction_offset, plaintext_space_total, 0);
+      ppi_scratch_entry *e = &scratch->entries[ppi_idx];
+
+      for (i = 0; i < e->num_potential_start_indices; i++, j++) {
+        potential_start_indices[j] = e->potential_start_indices[i];
+        potential_start_index_positions[j] = e->potential_start_index_positions[i];
+        hash_base_indices[j] = hash_base_index;
+        ppi_refs[j] = ppi_cur;
+      }
+    }
+    ppi_cur = ppi_cur->next;
+    ppi_idx++;
+  }
+
+  /* Patch fa_args for single-device use.  Use j (actual filled count) rather
+   * than num_potential_start_indices in case another worker cracked a hash
+   * concurrently between binary search and this fill loop. */
+  fa_args->total_devices = 1;
+  fa_args->gpu.device_number = 0;
+  fa_args->use_barrier = 0;
+  fa_args->potential_start_indices = potential_start_indices;
+  fa_args->num_potential_start_indices = j;
+  fa_args->potential_start_index_positions = potential_start_index_positions;
+  fa_args->hash_base_indices = hash_base_indices;
+
+  start_timer(&start_time);
+
+  if (pthread_create(&fa_thread, NULL, &host_thread_false_alarm, fa_args)) {
+    perror("Failed to create false alarm thread"); exit(-1);
+  }
+  if (pthread_join(fa_thread, NULL) != 0) {
+    perror("Failed to join false alarm thread"); exit(-1);
+  }
+
+  /* Process results. */
+  for (j = 0; j < fa_args->num_results; j++) {
+    if (fa_args->results[j] != 0) {
+      char plaintext[MAX_PLAINTEXT_LEN] = {0};
+      unsigned int plaintext_len = 0;
+      unsigned char real_key[8] = {0};
+
+      index_to_plaintext(fa_args->results[j], fa_args->charset, charset_len, fa_args->plaintext_len_min, fa_args->plaintext_len_max, plaintext_space_up_to_index, plaintext, &plaintext_len);
+
+      if (fa_args->hash_type == HASH_NTLM) {
+        unsigned char hash[16] = {0};
+        char hash_hex[(sizeof(hash) * 2) + 1] = {0};
+        ntlm_hash(plaintext, plaintext_len, hash);
+        if (!bytes_to_hex(hash, sizeof(hash), hash_hex, sizeof(hash_hex)) || (strcmp(hash_hex, ppi_refs[j]->hash) != 0))
+          continue;
+      } else if (fa_args->hash_type == HASH_NETNTLMV1) {
+        unsigned char hash[8] = {0};
+        char hash_hex[(sizeof(hash) * 2) + 1] = {0};
+        char rkey_hex[(sizeof(hash) * 2) + 1] = {0};
+        setup_des_key(plaintext, real_key);
+        netntlmv1_hash(real_key, 8, hash);
+        if (!bytes_to_hex(hash, sizeof(hash), hash_hex, sizeof(hash_hex)) || (strncmp(hash_hex, ppi_refs[j]->hash, 16) != 0)) {
+          bytes_to_hex(real_key, sizeof(real_key), rkey_hex, sizeof(rkey_hex));
+          printf("Found super false positive!: (Net-NTLMv1('%s') == %s) != %s\n", rkey_hex, hash_hex, ppi_refs[j]->hash);
+          continue;
+        }
+      } else {
+        printf("WARNING: CPU code to double-check this cracked hash has not yet been added.  There is a 60%% chance this is a false positive!  A workaround is to use John The Ripper to validate this result(s).\n");
+      }
+
+      LOCK_PPI();
+      if (ppi_refs[j]->plaintext == NULL) {
+        ppi_refs[j]->plaintext = strdup(plaintext);
+        ppi_refs[j]->num_precomputed_end_indices = 0;
+        FREE(ppi_refs[j]->precomputed_end_indices);
+      }
+      UNLOCK_PPI();
+
+      if (ppi_refs[j]->plaintext != NULL) {
+        pthread_mutex_lock(&potfile_mutex);
+        save_cracked_hash(ppi_refs[j], fa_args->hash_type);
+        pthread_mutex_unlock(&potfile_mutex);
+
+        if (fa_args->hash_type == HASH_NETNTLMV1) {
+          char ptxt_hex[(sizeof(plaintext) * 2) + 1] = {0};
+          bytes_to_hex((unsigned char*)plaintext, 7, ptxt_hex, sizeof(ptxt_hex));
+          printf("%sHASH CRACKED => %s:1122334455667788:%s%s\n", GREENB, ppi_refs[j]->hash, ptxt_hex, CLR);  fflush(stdout);
+        } else {
+          printf("%sHASH CRACKED => %s:1122334455667788:%s%s\n", GREENB, (ppi_refs[j]->username != NULL) ? ppi_refs[j]->username : ppi_refs[j]->hash, plaintext, CLR);  fflush(stdout);
+        }
+      }
+    }
+  }
+
+  time_delta = get_elapsed(&start_time);
+  pthread_mutex_lock(&stats_mutex);
+  time_falsealarms += time_delta;
+  pthread_mutex_unlock(&stats_mutex);
+
+  seconds_to_human_time(time_str, sizeof(time_str), (unsigned int)time_delta);
+  printf("  Completed false alarm checks in %s.\n", time_str);  fflush(stdout);
+
+  FREE(potential_start_indices);
+  FREE(potential_start_index_positions);
+  FREE(hash_base_indices);
+  FREE(ppi_refs);
+  FREE(fa_args->results);
+  fa_args->num_results = 0;
 }
 
 
@@ -808,7 +1047,7 @@ void *host_thread_false_alarm(void *ptr) {
 
     CLCREATEARG(13, exec_block_scaler_buffer, CL_RO, exec_block_scaler, sizeof(cl_uint));
 
-    if (is_amd_gpu) {
+    if (args->use_barrier) {
       int barrier_ret = pthread_barrier_wait(&barrier);
       if ((barrier_ret != 0) && (barrier_ret != PTHREAD_BARRIER_SERIAL_THREAD)) {
 	fprintf(stderr, "pthread_barrier_wait() failed!\n"); fflush(stderr);
@@ -859,6 +1098,162 @@ void *host_thread_false_alarm(void *ptr) {
 
   pthread_exit(NULL);
   return NULL;
+}
+
+
+/* Benchmarks the precompute kernel at several candidate GWS values and
+ * returns the fastest one.  Returns 0 on failure or when only one candidate
+ * exists (no tuning needed).  Does NOT modify gpu->context/queue/kernel. */
+static size_t autotune_precompute_gws(thread_args *args) {
+  gpu_dev *gpu = &(args->gpu);
+  char *kernel_path = PRECOMPUTE_KERNEL_PATH, *kernel_name = "precompute";
+  cl_context context = NULL;
+  cl_command_queue queue = NULL;
+  cl_program program = NULL;
+  cl_kernel kernel = NULL;
+  cl_mem hash_type_buffer = NULL, hash_buffer = NULL, hash_len_buffer = NULL;
+  cl_mem charset_buffer = NULL, plen_min_buffer = NULL, plen_max_buffer = NULL;
+  cl_mem table_index_buffer = NULL, chain_len_buffer = NULL, dev_num_buffer = NULL;
+  cl_mem total_dev_buffer = NULL, scaler_buffer = NULL, out_buffer = NULL;
+  cl_ulong *output_block = NULL;
+  int err = 0;
+  size_t wg = 0, best_gws = 0, base = 0, max_cand = 0, candidates[8] = {0};
+  double best_throughput = 0.0;
+  unsigned int output_len = 0, num_cands = 0, charset_len = 0, m = 0, j = 0;
+  static const unsigned int mults[] = {1, 2, 4, 8, 16};
+  unsigned char hash_binary[32] = {0};
+  cl_uint hash_binary_len = 0, bench_dev = 0, bench_total = 1, bench_scaler = 0;
+  cl_ulong bench_chain_len = 0;
+
+  if (args->hash == NULL)
+    return 0;
+
+  hash_binary_len = hex_to_bytes(args->hash, sizeof(hash_binary), hash_binary);
+
+  output_len = args->chain_len / args->total_devices;
+  if ((args->chain_len % args->total_devices) != 0)
+    output_len++;
+
+  if (is_ntlm8(args->hash_type, args->charset, args->plaintext_len_min,
+               args->plaintext_len_max, args->reduction_offset, args->chain_len)) {
+    kernel_path = PRECOMPUTE_NTLM8_KERNEL_PATH;
+    kernel_name = "precompute_ntlm8";
+  } else if (is_ntlm9(args->hash_type, args->charset, args->plaintext_len_min,
+                      args->plaintext_len_max, args->reduction_offset, args->chain_len)) {
+    kernel_path = PRECOMPUTE_NTLM9_KERNEL_PATH;
+    kernel_name = "precompute_ntlm9";
+  }
+
+  context = CLCREATECONTEXT(context_callback, &(gpu->device));
+  queue = CLCREATEQUEUE(context, gpu->device);
+  load_kernel(context, 1, &(gpu->device), kernel_path, kernel_name,
+              &program, &kernel, args->hash_type);
+
+  if (rc_clGetKernelWorkGroupInfo(kernel, gpu->device, CL_KERNEL_WORK_GROUP_SIZE,
+                                  sizeof(size_t), &wg, NULL) != CL_SUCCESS) {
+    fprintf(stderr, "GWS autotune: failed to query work group size.\n");
+    goto done;
+  }
+
+  /* Build candidate set: base * {1,2,4,8,16}, cap each to output_len, dedup. */
+  base = wg * (size_t)gpu->num_work_units;
+  for (m = 0; m < 5; m++) {
+    size_t c = base * (size_t)mults[m];
+    if (c == 0) continue;
+    if (c > (size_t)output_len) c = (size_t)output_len;
+    for (j = 0; j < num_cands; j++)
+      if (candidates[j] == c) break;
+    if (j == num_cands && num_cands < 8)
+      candidates[num_cands++] = c;
+  }
+
+  if (num_cands <= 1) {
+    best_gws = (num_cands == 1) ? candidates[0] : 0;
+    goto done;
+  }
+
+  /* Size output buffer to the largest candidate. */
+  max_cand = candidates[0];
+  for (j = 1; j < num_cands; j++)
+    if (candidates[j] > max_cand) max_cand = candidates[j];
+
+  output_block = calloc(max_cand, sizeof(cl_ulong));
+  if (output_block == NULL) {
+    fprintf(stderr, "GWS autotune: out of memory.\n");
+    goto done;
+  }
+
+  charset_len = (strcmp(args->charset_name, "byte") == 0) ?
+                256 : (unsigned int)(strlen(args->charset) + 1);
+  bench_chain_len = (cl_ulong)args->chain_len;
+
+  CLCREATEARG(0, hash_type_buffer, CL_RO, args->hash_type, sizeof(cl_uint));
+  CLCREATEARG_ARRAY(1, hash_buffer, CL_RO, hash_binary, hash_binary_len);
+  CLCREATEARG(2, hash_len_buffer, CL_RO, hash_binary_len, sizeof(cl_uint));
+  CLCREATEARG_ARRAY(3, charset_buffer, CL_RO, args->charset, charset_len);
+  CLCREATEARG(4, plen_min_buffer, CL_RO, args->plaintext_len_min, sizeof(cl_uint));
+  CLCREATEARG(5, plen_max_buffer, CL_RO, args->plaintext_len_max, sizeof(cl_uint));
+  CLCREATEARG(6, table_index_buffer, CL_RO, args->table_index, sizeof(cl_uint));
+  CLCREATEARG(7, chain_len_buffer, CL_RO, bench_chain_len, sizeof(cl_ulong));
+  CLCREATEARG(8, dev_num_buffer, CL_RO, bench_dev, sizeof(cl_uint));
+  CLCREATEARG(9, total_dev_buffer, CL_RO, bench_total, sizeof(cl_uint));
+  CLCREATEARG(10, scaler_buffer, CL_RO, bench_scaler, sizeof(cl_uint));
+  CLCREATEARG_ARRAY(11, out_buffer, CL_WO, output_block, max_cand * sizeof(cl_ulong));
+
+  printf("  Autotuning GWS for GPU #%u...\n", gpu->device_number); fflush(stdout);
+
+  for (m = 0; m < num_cands; m++) {
+    size_t gws = candidates[m];
+    struct timespec t = {0};
+    double elapsed = 0.0, throughput = 0.0;
+    int r = 0;
+
+    /* Warm-up run (discarded). */
+    CLRUNKERNEL(queue, kernel, &gws);
+    CLFLUSH(queue);
+    CLWAIT(queue);
+
+    /* Three timed runs. */
+    start_timer(&t);
+    for (r = 0; r < 3; r++) {
+      CLRUNKERNEL(queue, kernel, &gws);
+      CLFLUSH(queue);
+      CLWAIT(queue);
+    }
+    elapsed = get_elapsed(&t);
+    if (elapsed <= 0.0) elapsed = 1e-9;
+    throughput = (double)gws * 3.0 / elapsed;
+
+    if (throughput > best_throughput) {
+      best_throughput = throughput;
+      best_gws = gws;
+    }
+  }
+
+  CLFREEBUFFER(hash_type_buffer);
+  CLFREEBUFFER(hash_buffer);
+  CLFREEBUFFER(hash_len_buffer);
+  CLFREEBUFFER(charset_buffer);
+  CLFREEBUFFER(plen_min_buffer);
+  CLFREEBUFFER(plen_max_buffer);
+  CLFREEBUFFER(table_index_buffer);
+  CLFREEBUFFER(chain_len_buffer);
+  CLFREEBUFFER(dev_num_buffer);
+  CLFREEBUFFER(total_dev_buffer);
+  CLFREEBUFFER(scaler_buffer);
+  CLFREEBUFFER(out_buffer);
+  free(output_block);
+  output_block = NULL;
+
+  printf("  GWS autotune GPU #%u: selected %zu.\n", gpu->device_number, best_gws);
+  fflush(stdout);
+
+done:
+  CLRELEASEKERNEL(kernel);
+  CLRELEASEPROGRAM(program);
+  CLRELEASEQUEUE(queue);
+  CLRELEASECONTEXT(context);
+  return best_gws;
 }
 
 
@@ -921,16 +1316,22 @@ void *host_thread_precompute(void *ptr) {
   queue = gpu->queue;
   kernel = gpu->kernel;
 
-  if (rc_clGetKernelWorkGroupInfo(kernel, gpu->device, CL_KERNEL_WORK_GROUP_SIZE /*CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE*/, sizeof(size_t), &gws, NULL) != CL_SUCCESS) {
-    fprintf(stderr, "Failed to get preferred work group size!\n");
-    CLRELEASEKERNEL(gpu->kernel);
-    CLRELEASEPROGRAM(gpu->program);
-    CLRELEASEQUEUE(gpu->queue);
-    CLRELEASECONTEXT(gpu->context);
-    pthread_exit(NULL);
-    return NULL;
+  if (user_provided_gws > 0) {
+    gws = user_provided_gws;
+  } else if (gpu->tuned_gws > 0) {
+    gws = gpu->tuned_gws;
+  } else {
+    if (rc_clGetKernelWorkGroupInfo(kernel, gpu->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &gws, NULL) != CL_SUCCESS) {
+      fprintf(stderr, "Failed to get preferred work group size!\n");
+      CLRELEASEKERNEL(gpu->kernel);
+      CLRELEASEPROGRAM(gpu->program);
+      CLRELEASEQUEUE(gpu->queue);
+      CLRELEASECONTEXT(gpu->context);
+      pthread_exit(NULL);
+      return NULL;
+    }
+    gws = gws * gpu->num_work_units;
   }
-  gws = gws * gpu->num_work_units;
 
   /* In the event that the global work size is larger than the number of outputs we
    * need, cap the GWS. */
@@ -1280,6 +1681,7 @@ void _preloading_thread(char *rt_dir) {
     return;
 
   while ((de = readdir(dir)) != NULL) {
+    if (stop_preloading) break;
 
     /* Create an absolute path to this entity. */
     filepath_join(filepath, sizeof(filepath), rt_dir, de->d_name);
@@ -1385,8 +1787,13 @@ void _preloading_thread(char *rt_dir) {
 
 	  /* If we preloaded the maximum number of tables, wait for the main thread to consume at least one
 	   * before preloading more. */
-	  while (num_preloaded_tables_available >= MAX_PRELOAD_NUM)
+	  while ((num_preloaded_tables_available >= max_preload_num) && !stop_preloading)
 	    pthread_cond_wait(&condition_continue_loading_tables, &preloaded_tables_lock);
+	  if (stop_preloading) {
+	    pthread_mutex_unlock(&preloaded_tables_lock);
+	    closedir(dir); dir = NULL;
+	    return;
+	  }
 
 	  /* Release the preloading system lock. */
 	  pthread_mutex_unlock(&preloaded_tables_lock);
@@ -1419,7 +1826,7 @@ void *preloading_thread(void *ptr) {
 
   /* If the main thread is still waiting on new tables, wake it up. */
   pthread_mutex_lock(&preloaded_tables_lock);
-  pthread_cond_signal(&condition_wait_for_tables);
+  pthread_cond_broadcast(&condition_wait_for_tables);
   pthread_mutex_unlock(&preloaded_tables_lock);
   return NULL;
 }
@@ -1505,19 +1912,20 @@ unsigned int _rt_binary_search(cl_ulong *rainbow_table, unsigned int low, unsign
 void *rt_binary_search_thread(void *ptr) {
   search_thread_args *args = (search_thread_args *)ptr;
   precomputed_and_potential_indices *ppi_cur = args->ppi_head;
-  unsigned int i = 0;
+  unsigned int i = 0, ppi_idx = 0;
   cl_ulong start = 0;
 
 
   while (ppi_cur != NULL) {
-    if (ppi_cur->plaintext == NULL) { /* If this hash isn't cracked yet... */
+    if (ppi_cur->plaintext == NULL) {
       for (i = 0 + args->thread_number; i < ppi_cur->num_precomputed_end_indices; i += args->total_threads) {
 	if (_rt_binary_search(args->rainbow_table, 0, args->num_chains, ppi_cur->precomputed_end_indices[i], &start)) {
-	  add_potential_start_index_and_position(ppi_cur, start, i);
+	  scratch_add_match(args->scratch, ppi_idx, start, i);
 	}
       }
     }
     ppi_cur = ppi_cur->next;
+    ppi_idx++;
   }
 
   pthread_exit(NULL);
@@ -1529,10 +1937,9 @@ void *rt_binary_search_thread(void *ptr) {
  * precomputed end indices.  If/when matches are found, the corresponding start indices
  * are added to the precomputed_and_potential_indices's potential_start_indices
  * array. */
-void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precomputed_and_potential_indices *ppi_head) {
+void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precomputed_and_potential_indices *ppi_head, unsigned int num_threads, worker_scratch *scratch) {
   struct timespec start_time_searching = {0};
   char time_searching_str[64] = {0};
-  unsigned int num_threads = get_num_cpu_cores();
   pthread_t *threads = NULL;
   search_thread_args *args = NULL;
   unsigned int i = 0;
@@ -1547,14 +1954,13 @@ void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precompu
     exit(-1);
   }
 
-  printf("  Searching table for matching endpoints...\n");  fflush(stdout);
-
   for (i = 0; i < num_threads; i++) {
     args[i].thread_number = i;
     args[i].total_threads = num_threads;
     args[i].rainbow_table = rainbow_table;
     args[i].num_chains = num_chains;
     args[i].ppi_head = ppi_head;
+    args[i].scratch = scratch;
 
     if (pthread_create(&(threads[i]), NULL, &rt_binary_search_thread, &(args[i]))) {
       perror("Failed to create thread");
@@ -1562,7 +1968,6 @@ void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precompu
     }
   }
 
-  /* Wait for all threads to finish. */
   for (i = 0; i < num_threads; i++) {
     if (pthread_join(threads[i], NULL) != 0) {
       perror("Failed to join with thread");
@@ -1574,7 +1979,10 @@ void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precompu
   seconds_to_human_time(time_searching_str, sizeof(time_searching_str), s_time);
   printf("  Table searched in %s.\n", time_searching_str);  fflush(stdout);
 
+  pthread_mutex_lock(&stats_mutex);
   time_searching += s_time;
+  pthread_mutex_unlock(&stats_mutex);
+
   FREE(args);
   FREE(threads);
 }
@@ -1658,8 +2066,10 @@ void save_cracked_hash(precomputed_and_potential_indices *ppi, unsigned int hash
     /*exit(-1);*/
   }
 
+  pthread_mutex_lock(&stats_mutex);
   num_cracked++;
   num_falsealarms--;
+  pthread_mutex_unlock(&stats_mutex);
 }
 
 
@@ -1782,77 +2192,133 @@ preloaded_table *get_preloaded_table() {
 }
 
 
-void search_tables(unsigned int total_tables, precomputed_and_potential_indices *ppi, thread_args *args) {
-  unsigned int num_uncracked = 0, current_table = 0;
-  struct timespec start_time_table = {0};
-  precomputed_and_potential_indices *ppi_cur = NULL;
-  preloaded_table *pt = NULL;
-
+/* One worker in the parallel table-search pool.  Gets tables from the shared
+ * preload queue, binary-searches each, acquires a GPU slot, runs false-alarm
+ * checks on the acquired device, then releases the slot. */
+void *table_worker_thread(void *ptr) {
+  worker_thread_args *wargs = (worker_thread_args *)ptr;
+  worker_scratch *scratch = alloc_worker_scratch(wargs->ppi_head);
 
   while (1) {
+    preloaded_table *pt = NULL;
+    cl_ulong *rainbow_table = NULL;
+    unsigned int num_chains = 0;
+    unsigned int dev_slot = 0;
+    thread_args fa_args;
 
-    /* Count the number of uncracked hashes we have left. */
-    ppi_cur = ppi;
-    num_uncracked = 0;
-    while (ppi_cur != NULL) {
-      if (ppi_cur->plaintext == NULL)
-	num_uncracked++;
+    pthread_mutex_lock(&stats_mutex);
+    if (all_cracked) { pthread_mutex_unlock(&stats_mutex); break; }
+    pthread_mutex_unlock(&stats_mutex);
 
-      ppi_cur = ppi_cur->next;
-    }
-
-    /* If all the hashes were cracked, there's no need to continue processing
-     * tables. */
-    if (num_uncracked == 0) {
-      printf("All hashes cracked.  Skipping rest of tables.\n");
-      break;
-    }
-
-    /* Get the next preloaded table.  If NULL, we reached the end. */
     pt = get_preloaded_table();
-    if (pt == NULL)
-      break;
+    if (pt == NULL) break;
 
-    current_table++;
-    printf("[%u of %u] Processing table: %s...\n", current_table, total_tables, pt->filepath);  fflush(stdout);
-
-    start_timer(&start_time_table);
-    rt_binary_search(pt->rainbow_table, pt->num_chains, ppi);
-
-    num_chains_processed += pt->num_chains;
-    num_tables_processed++;
-
-    /* Free the preloaded table. */
+    rainbow_table = pt->rainbow_table;
+    num_chains = pt->num_chains;
+    printf("  [worker %u] Processing: %s\n", wargs->worker_id, pt->filepath);  fflush(stdout);
     FREE(pt->filepath);
-    FREE(pt->rainbow_table);
-    pt->num_chains = 0;
     FREE(pt);
 
-    /* Check endpoint matches. */
-    check_false_alarms(ppi, args);
+    clear_worker_scratch(scratch);
+    rt_binary_search(rainbow_table, num_chains, wargs->ppi_head, wargs->bs_threads, scratch);
+    FREE(rainbow_table);
 
-    printf("  Table fully processed in %.1f seconds.\n", get_elapsed(&start_time_table)); fflush(stdout);
-    print_eta_search(num_tables_processed, total_tables);
-    printf("  Cracked %u of %u hashes.\n\n", num_cracked, num_hashes);
+    /* Acquire a GPU device slot. */
+    pthread_mutex_lock(&device_pool_mutex);
+    while (device_pool_count == 0)
+      pthread_cond_wait(&device_pool_cond, &device_pool_mutex);
+    device_pool_count--;
+    dev_slot = device_pool_slots[device_pool_count];
+    pthread_mutex_unlock(&device_pool_mutex);
 
-    /* We checked the potential matches above, so there's nothing else to do with
-     * them. */
-    clear_potential_start_indices(ppi);
+    /* Copy template args for this device; patch for single-device use. */
+    fa_args = wargs->all_device_args[dev_slot];
 
+    check_false_alarms_worker(wargs->ppi_head, scratch, &fa_args);
+
+    /* Return the GPU device slot. */
+    pthread_mutex_lock(&device_pool_mutex);
+    device_pool_slots[device_pool_count] = dev_slot;
+    device_pool_count++;
+    pthread_cond_signal(&device_pool_cond);
+    pthread_mutex_unlock(&device_pool_mutex);
+
+    pthread_mutex_lock(&stats_mutex);
+    num_chains_processed += num_chains;
+    num_tables_processed++;
+    if (num_cracked >= num_hashes && num_hashes > 0)
+      all_cracked = 1;
+    pthread_mutex_unlock(&stats_mutex);
   }
 
-  /* Free any remaining preloaded tables (i.e.: if we cracked all the hashes and quit early). */
-  /* Note: technically, this may not be a complete solution, if this is reached while the preloading
-   * thread is still performing work... */
+  free_worker_scratch(scratch);
+  return NULL;
+}
+
+
+void search_tables(unsigned int total_tables, precomputed_and_potential_indices *ppi, thread_args *args) {
+  unsigned int num_cores = get_num_cpu_cores();
+  unsigned int num_devices = args[0].total_devices;
+  unsigned int i = 0;
+
+  /* W = number of parallel workers; at least num_devices+1 so CPU work can
+   * overlap GPU work, clamped to [2, 8]. */
+  unsigned int W = num_cores / 2;
+  if (W < 2) W = 2;
+  if (W < num_devices + 1) W = num_devices + 1;
+  if (W > 8) W = 8;
+
+  /* Split cores evenly across workers (at least 1 per worker). */
+  unsigned int bs_threads = num_cores / W;
+  if (bs_threads < 1) bs_threads = 1;
+
+  max_preload_num = W + 1;
+
+  /* Populate the device pool with all device indices. */
+  pthread_mutex_lock(&device_pool_mutex);
+  for (i = 0; i < num_devices; i++)
+    device_pool_slots[i] = i;
+  device_pool_count = num_devices;
+  pthread_mutex_unlock(&device_pool_mutex);
+
+  printf("Binary searching with %u workers, %u threads each (total tables: %u).\n", W, bs_threads, total_tables);  fflush(stdout);
+
+  worker_thread_args *wargs = calloc(W, sizeof(worker_thread_args));
+  pthread_t *worker_threads = calloc(W, sizeof(pthread_t));
+  if ((wargs == NULL) || (worker_threads == NULL)) {
+    fprintf(stderr, "Failed to allocate worker args.\n"); exit(-1);
+  }
+
+  for (i = 0; i < W; i++) {
+    wargs[i].ppi_head = ppi;
+    wargs[i].all_device_args = args;
+    wargs[i].num_devices = num_devices;
+    wargs[i].bs_threads = bs_threads;
+    wargs[i].worker_id = i;
+
+    if (pthread_create(&worker_threads[i], NULL, table_worker_thread, &wargs[i])) {
+      perror("Failed to create worker thread"); exit(-1);
+    }
+  }
+
+  for (i = 0; i < W; i++) {
+    if (pthread_join(worker_threads[i], NULL) != 0) {
+      perror("Failed to join worker thread"); exit(-1);
+    }
+  }
+
+  FREE(wargs);
+  FREE(worker_threads);
+
+  /* Signal the preloader to stop (in case of early exit) and drain remaining tables. */
   pthread_mutex_lock(&preloaded_tables_lock);
+  stop_preloading = 1;
+  pthread_cond_broadcast(&condition_continue_loading_tables);
   while (preloaded_table_list != NULL) {
     preloaded_table *pt_next = preloaded_table_list->next;
-
     FREE(preloaded_table_list->filepath);
     FREE(preloaded_table_list->rainbow_table);
-    preloaded_table_list->num_chains = 0;
     FREE(preloaded_table_list);
-
     preloaded_table_list = pt_next;
   }
   pthread_mutex_unlock(&preloaded_tables_lock);
@@ -1921,7 +2387,7 @@ int main(int ac, char **av) {
     exit(-1);
   }
 
-  printf("Binary searching will be done with %u threads.\n", get_num_cpu_cores());
+  printf("GPU devices: %u.  Binary search workers will be determined automatically.\n", num_devices);
 
   /* First arg is the directory (and/or sub-directories) containing rainbow tables. */
   rt_dir = av[1];
@@ -2215,6 +2681,15 @@ int main(int ac, char **av) {
     get_device_uint(args[i].gpu.device, CL_DEVICE_MAX_COMPUTE_UNITS, &(args[i].gpu.num_work_units));
   }
 
+  /* Autotune GWS for each device empirically unless the user specified one. */
+  if (user_provided_gws == 0) {
+    for (i = 0; i < num_devices; i++) {
+      args[i].hash = hashes[0];
+      args[i].gpu.tuned_gws = autotune_precompute_gws(&args[i]);
+      args[i].hash = NULL;
+    }
+  }
+
   num_hashes_precomputed_total = num_hashes;
   start_timer(&precompute_start_time);
   for (i = 0; i < num_hashes; i++) {
@@ -2249,6 +2724,9 @@ int main(int ac, char **av) {
   total_tables = count_tables(rt_dir);
   start_timer(&search_start_time);
   search_tables(total_tables, ppi_head, args);
+
+  /* Join the preload thread (it may still be running if we exited early). */
+  pthread_join(preload_thread_id, NULL);
 
   seconds_to_human_time(time_precomp_str, sizeof(time_precomp_str), time_precomp);
   seconds_to_human_time(time_io_str, sizeof(time_io_str), time_io);

@@ -183,6 +183,7 @@ typedef struct {
   unsigned int num_devices;
   unsigned int bs_threads;
   unsigned int worker_id;
+  unsigned int total_tables;
 } worker_thread_args;
 
 
@@ -272,6 +273,9 @@ struct timespec precompute_start_time = {0};
 
 /* The time at which table searching begins. */
 struct timespec search_start_time = {0};
+
+/* Timestamp of the last ETA progress line; reset at search start. */
+struct timespec last_eta_print = {0};
 
 /* Number of uncracked hashes. */
 unsigned int num_hashes = 0;
@@ -1876,16 +1880,18 @@ void print_eta_precompute() {
  * completion. */
 void print_eta_search(unsigned int num_tables_processed, unsigned int num_tables_total) {
   char eta_str[64] = {0};
+  unsigned int pct = (num_tables_total > 0) ? (num_tables_processed * 100 / num_tables_total) : 0;
 
-  strncpy(eta_str, "Unknown", sizeof(eta_str) - 1);
+  strncpy(eta_str, "unknown", sizeof(eta_str) - 1);
   if ((num_tables_processed > 0) && (num_tables_total >= num_tables_processed)) {
-    double seconds_per_table = (double)(get_elapsed(&search_start_time) / (double)num_tables_processed);
+    double seconds_per_table = get_elapsed(&search_start_time) / (double)num_tables_processed;
     unsigned int num_tables_left = num_tables_total - num_tables_processed;
-    unsigned int num_seconds_left = num_tables_left * seconds_per_table;
+    unsigned int num_seconds_left = (unsigned int)(num_tables_left * seconds_per_table);
 
     seconds_to_human_time(eta_str, sizeof(eta_str), num_seconds_left);
   }
-  printf("  Estimated time remaining (at most): %s\n", eta_str); fflush(stdout);
+  printf("  Progress: %u/%u tables (%u%%) | ETA: %s\n", num_tables_processed, num_tables_total, pct, eta_str);
+  fflush(stdout);
 }
 
 
@@ -2278,6 +2284,10 @@ void *table_worker_thread(void *ptr) {
     num_tables_processed++;
     if (num_cracked >= num_hashes && num_hashes > 0)
       all_cracked = 1;
+    if (get_elapsed(&last_eta_print) >= 60.0) {
+      start_timer(&last_eta_print);
+      print_eta_search(num_tables_processed, wargs->total_tables);
+    }
     pthread_mutex_unlock(&stats_mutex);
   }
 
@@ -2319,12 +2329,15 @@ void search_tables(unsigned int total_tables, precomputed_and_potential_indices 
     fprintf(stderr, "Failed to allocate worker args.\n"); exit(-1);
   }
 
+  start_timer(&last_eta_print);
+
   for (i = 0; i < W; i++) {
     wargs[i].ppi_head = ppi;
     wargs[i].all_device_args = args;
     wargs[i].num_devices = num_devices;
     wargs[i].bs_threads = bs_threads;
     wargs[i].worker_id = i;
+    wargs[i].total_tables = total_tables;
 
     if (pthread_create(&worker_threads[i], NULL, table_worker_thread, &wargs[i])) {
       perror("Failed to create worker thread"); exit(-1);

@@ -196,7 +196,7 @@ void print_eta_precompute();
 cl_ulong *search_precompute_cache(char *index_data, unsigned int *num_indices, char *filename, unsigned int filename_size);
 void search_tables(unsigned int total_tables, precomputed_and_potential_indices *ppi, thread_args *args);
 void save_cracked_hash(precomputed_and_potential_indices *ppi, unsigned int hash_type);
-void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, worker_scratch *scratch, thread_args *fa_args);
+void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, worker_scratch *scratch, thread_args *fa_args, unsigned int dev_slot);
 void *table_worker_thread(void *ptr);
 worker_scratch *alloc_worker_scratch(precomputed_and_potential_indices *ppi_head);
 void free_worker_scratch(worker_scratch *scratch);
@@ -574,7 +574,7 @@ void check_false_alarms(precomputed_and_potential_indices *ppi, thread_args *arg
  * Reads match candidates from scratch (not from ppi nodes), runs them on
  * one GPU device, writes cracked plaintexts back to ppi nodes under ppi_mutex,
  * and writes pot-file entries under potfile_mutex. */
-void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, worker_scratch *scratch, thread_args *fa_args) {
+void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, worker_scratch *scratch, thread_args *fa_args, unsigned int dev_slot) {
   pthread_t fa_thread = {0};
   char time_str[128] = {0};
   struct timespec start_time = {0};
@@ -716,7 +716,7 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
   pthread_mutex_unlock(&stats_mutex);
 
   seconds_to_human_time(time_str, sizeof(time_str), (unsigned int)time_delta);
-  printf("  Completed false alarm checks in %s.\n", time_str);  fflush(stdout);
+  printf("  [GPU #%u] Completed false alarm checks in %s.\n", dev_slot, time_str);  fflush(stdout);
 
   FREE(potential_start_indices);
   FREE(potential_start_index_positions);
@@ -1880,17 +1880,20 @@ void print_eta_precompute() {
  * completion. */
 void print_eta_search(unsigned int num_tables_processed, unsigned int num_tables_total) {
   char eta_str[64] = {0};
+  char elapsed_str[64] = {0};
   unsigned int pct = (num_tables_total > 0) ? (num_tables_processed * 100 / num_tables_total) : 0;
+  double elapsed = get_elapsed(&search_start_time);
 
+  seconds_to_human_time(elapsed_str, sizeof(elapsed_str), (unsigned int)elapsed);
   strncpy(eta_str, "unknown", sizeof(eta_str) - 1);
   if ((num_tables_processed > 0) && (num_tables_total >= num_tables_processed)) {
-    double seconds_per_table = get_elapsed(&search_start_time) / (double)num_tables_processed;
+    double seconds_per_table = elapsed / (double)num_tables_processed;
     unsigned int num_tables_left = num_tables_total - num_tables_processed;
     unsigned int num_seconds_left = (unsigned int)(num_tables_left * seconds_per_table);
 
     seconds_to_human_time(eta_str, sizeof(eta_str), num_seconds_left);
   }
-  printf("  Progress: %u/%u tables (%u%%) | ETA: %s\n", num_tables_processed, num_tables_total, pct, eta_str);
+  printf("\n  Progress: %u/%u tables (%u%%) | Elapsed: %s | ETA: %s\n\n", num_tables_processed, num_tables_total, pct, elapsed_str, eta_str);
   fflush(stdout);
 }
 
@@ -2263,7 +2266,7 @@ void *table_worker_thread(void *ptr) {
     /* Copy template args for this device; patch for single-device use. */
     fa_args = wargs->all_device_args[dev_slot];
 
-    check_false_alarms_worker(wargs->ppi_head, scratch, &fa_args);
+    check_false_alarms_worker(wargs->ppi_head, scratch, &fa_args, dev_slot);
 
     /* Write back the FA kernel cache so the next use of this device slot
      * reuses the compiled kernel instead of recompiling. */

@@ -2333,7 +2333,9 @@ void *table_worker_thread(void *ptr) {
     pthread_mutex_unlock(&stats_mutex);
 
     pt = get_preloaded_table();
-    if (pt == NULL) {
+    /* Capture the end-of-tables sentinel BEFORE FREE(pt) nulls the pointer. */
+    int no_more_tables = (pt == NULL);
+    if (no_more_tables) {
       /* No more tables; flush any accumulated BS results. */
       flush_fa = (tables_in_scratch > 0);
     } else {
@@ -2341,7 +2343,7 @@ void *table_worker_thread(void *ptr) {
       num_chains = pt->num_chains;
       printf("  [worker %u] Processing: %s\n", wargs->worker_id, pt->filepath);  fflush(stdout);
       FREE(pt->filepath);
-      FREE(pt);
+      FREE(pt);  /* pt is now NULL — that is fine; no_more_tables is already captured */
 
       /* Accumulate BS results into scratch without clearing between tables. */
       rt_binary_search(rainbow_table, num_chains, wargs->ppi_head, wargs->bs_threads, scratch);
@@ -2399,8 +2401,8 @@ void *table_worker_thread(void *ptr) {
       tables_in_scratch = 0;
     }
 
-    if (pt == NULL) {
-      fprintf(stderr, "[worker %u] Exiting: get_preloaded_table() returned NULL\n", wargs->worker_id);  fflush(stderr);
+    if (no_more_tables) {
+      fprintf(stderr, "[worker %u] Exiting: no more tables.\n", wargs->worker_id);  fflush(stderr);
       break;
     }
   }

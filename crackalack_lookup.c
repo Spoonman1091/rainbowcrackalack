@@ -1211,6 +1211,9 @@ static size_t autotune_precompute_gws(thread_args *args) {
 
   if (num_cands <= 1) {
     best_gws = (num_cands == 1) ? candidates[0] : 0;
+    fprintf(stderr, "[autotune diag] early-exit: num_cands=%u best_gws=%zu output_len=%u\n",
+            num_cands, best_gws, output_len);
+    fflush(stderr);
     goto done;
   }
 
@@ -1455,6 +1458,13 @@ void *host_thread_precompute(void *ptr) {
   CLCREATEARG_ARRAY(11, output_block_buffer, CL_WO, output_block, output_block_len * sizeof(cl_ulong));
   /*CLCREATEARG_DEBUG(9, debug_buffer, debug_ptr);*/
 
+  fprintf(stderr, "[precompute diag] charset='%s' charset_len=%d table_index=%u "
+          "plaintext_len=%u-%u chain_len=%lu hash=%s gws=%zu num_exec_blocks=%u\n",
+          args->charset_name, charset_len, args->table_index,
+          args->plaintext_len_min, args->plaintext_len_max,
+          (unsigned long)args->chain_len, args->hash, gws, num_exec_blocks);
+  fflush(stderr);
+
   for (exec_block = 0; exec_block < num_exec_blocks; exec_block++) {
     unsigned int exec_block_scaler = exec_block * gws;
 
@@ -1536,6 +1546,8 @@ void precompute_hash(unsigned int num_devices, thread_args *args, precomputed_an
 
   /* Set the index data we're looking for (or will create later). */
   snprintf(index_data, sizeof(index_data) - 1, "%s_%s#%d-%d_%d_%d:%s\n", args->hash_name, args->charset_name, args->plaintext_len_min, args->plaintext_len_max, args->table_index, args->chain_len, args->hash); /*ntlm_loweralpha#8-8_0_100:49e5bfaab1be72a6c5236f15736a3e15*/
+  fprintf(stderr, "[precompute_hash diag] index_data='%s'\n", index_data);
+  fflush(stderr);
 
   /* Search through the cache and see if we already precomputed the indices for this
    * hash. */

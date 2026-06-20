@@ -62,6 +62,11 @@
 #define FALSE_ALARM_NTLM9_KERNEL_PATH "false_alarm_check_ntlm9.cl"
 #define FALSE_ALARM_NETNTLMV1_KERNEL_PATH "false_alarm_check_netntlv1.cl"
 
+/* Number of tables whose binary-search results are accumulated per worker
+ * before triggering one GPU FA launch.  Increases FA kernel occupancy from
+ * ~0.5% per table to ~2% at 4, reducing total FA wall-clock time. */
+#define FA_BATCH_SIZE 4
+
 #define HASH_FILE_FORMAT_PLAIN 1
 #define HASH_FILE_FORMAT_PWDUMP 2
 
@@ -1282,6 +1287,35 @@ done:
 }
 
 
+/* Pre-warms the FA kernel for one device by JIT-compiling it at startup so the
+ * first table's FA call does not pay the ~11.5 s compilation penalty. */
+static void prewarm_fa_kernel(thread_args *args) {
+  char *kernel_path = FALSE_ALARM_KERNEL_PATH, *kernel_name = "false_alarm_check";
+  gpu_dev *gpu = &(args->gpu);
+  int err = 0;
+
+  if (is_ntlm8(args->hash_type, args->charset, args->plaintext_len_min,
+               args->plaintext_len_max, args->reduction_offset, args->chain_len)) {
+    kernel_path = FALSE_ALARM_NTLM8_KERNEL_PATH;
+    kernel_name = "false_alarm_check_ntlm8";
+  } else if (is_ntlm9(args->hash_type, args->charset, args->plaintext_len_min,
+                      args->plaintext_len_max, args->reduction_offset, args->chain_len)) {
+    kernel_path = FALSE_ALARM_NTLM9_KERNEL_PATH;
+    kernel_name = "false_alarm_check_ntlm9";
+  }
+
+  printf("  Pre-warming FA kernel for GPU #%u (%s)...", gpu->device_number, kernel_name);
+  fflush(stdout);
+
+  gpu->fa_context = CLCREATECONTEXT(context_callback, &(gpu->device));
+  gpu->fa_queue   = CLCREATEQUEUE(gpu->fa_context, gpu->device);
+  load_kernel(gpu->fa_context, 1, &(gpu->device), kernel_path, kernel_name,
+              &(gpu->fa_program), &(gpu->fa_kernel), args->hash_type);
+
+  printf(" done.\n"); fflush(stdout);
+}
+
+
 /* A host thread which controls each GPU for hash pre-computation. */
 void *host_thread_precompute(void *ptr) {
   thread_args *args = (thread_args *)ptr;
@@ -2225,12 +2259,13 @@ preloaded_table *get_preloaded_table() {
 }
 
 
-/* One worker in the parallel table-search pool.  Gets tables from the shared
- * preload queue, binary-searches each, acquires a GPU slot, runs false-alarm
- * checks on the acquired device, then releases the slot. */
+/* One worker in the parallel table-search pool.  Accumulates binary-search
+ * results from FA_BATCH_SIZE tables before triggering one GPU FA launch, which
+ * increases kernel occupancy ~4× vs. launching per-table. */
 void *table_worker_thread(void *ptr) {
   worker_thread_args *wargs = (worker_thread_args *)ptr;
   worker_scratch *scratch = alloc_worker_scratch(wargs->ppi_head);
+  unsigned int tables_in_scratch = 0;
 
   while (1) {
     preloaded_table *pt = NULL;
@@ -2238,61 +2273,80 @@ void *table_worker_thread(void *ptr) {
     unsigned int num_chains = 0;
     unsigned int dev_slot = 0;
     thread_args fa_args;
+    int flush_fa = 0;
 
     pthread_mutex_lock(&stats_mutex);
     if (all_cracked) { pthread_mutex_unlock(&stats_mutex); break; }
     pthread_mutex_unlock(&stats_mutex);
 
     pt = get_preloaded_table();
-    if (pt == NULL) break;
+    if (pt == NULL) {
+      /* No more tables; flush any accumulated BS results. */
+      flush_fa = (tables_in_scratch > 0);
+    } else {
+      rainbow_table = pt->rainbow_table;
+      num_chains = pt->num_chains;
+      printf("  [worker %u] Processing: %s\n", wargs->worker_id, pt->filepath);  fflush(stdout);
+      FREE(pt->filepath);
+      FREE(pt);
 
-    rainbow_table = pt->rainbow_table;
-    num_chains = pt->num_chains;
-    printf("  [worker %u] Processing: %s\n", wargs->worker_id, pt->filepath);  fflush(stdout);
-    FREE(pt->filepath);
-    FREE(pt);
+      /* Accumulate BS results into scratch without clearing between tables. */
+      rt_binary_search(rainbow_table, num_chains, wargs->ppi_head, wargs->bs_threads, scratch);
+      FREE(rainbow_table);
+      tables_in_scratch++;
 
-    clear_worker_scratch(scratch);
-    rt_binary_search(rainbow_table, num_chains, wargs->ppi_head, wargs->bs_threads, scratch);
-    FREE(rainbow_table);
+      /* Update chain/table stats immediately so ETA is current. */
+      pthread_mutex_lock(&stats_mutex);
+      num_chains_processed += num_chains;
+      num_tables_processed++;
+      if (get_elapsed(&last_eta_print) >= 60.0) {
+        start_timer(&last_eta_print);
+        print_eta_search(num_tables_processed, wargs->total_tables);
+      }
+      pthread_mutex_unlock(&stats_mutex);
 
-    /* Acquire a GPU device slot. */
-    pthread_mutex_lock(&device_pool_mutex);
-    while (device_pool_count == 0)
-      pthread_cond_wait(&device_pool_cond, &device_pool_mutex);
-    device_pool_count--;
-    dev_slot = device_pool_slots[device_pool_count];
-    pthread_mutex_unlock(&device_pool_mutex);
-
-    /* Copy template args for this device; patch for single-device use. */
-    fa_args = wargs->all_device_args[dev_slot];
-
-    check_false_alarms_worker(wargs->ppi_head, scratch, &fa_args, dev_slot);
-
-    /* Write back the FA kernel cache so the next use of this device slot
-     * reuses the compiled kernel instead of recompiling. */
-    wargs->all_device_args[dev_slot].gpu.fa_context = fa_args.gpu.fa_context;
-    wargs->all_device_args[dev_slot].gpu.fa_queue   = fa_args.gpu.fa_queue;
-    wargs->all_device_args[dev_slot].gpu.fa_program = fa_args.gpu.fa_program;
-    wargs->all_device_args[dev_slot].gpu.fa_kernel  = fa_args.gpu.fa_kernel;
-
-    /* Return the GPU device slot. */
-    pthread_mutex_lock(&device_pool_mutex);
-    device_pool_slots[device_pool_count] = dev_slot;
-    device_pool_count++;
-    pthread_cond_signal(&device_pool_cond);
-    pthread_mutex_unlock(&device_pool_mutex);
-
-    pthread_mutex_lock(&stats_mutex);
-    num_chains_processed += num_chains;
-    num_tables_processed++;
-    if (num_cracked >= num_hashes && num_hashes > 0)
-      all_cracked = 1;
-    if (get_elapsed(&last_eta_print) >= 60.0) {
-      start_timer(&last_eta_print);
-      print_eta_search(num_tables_processed, wargs->total_tables);
+      flush_fa = (tables_in_scratch >= FA_BATCH_SIZE);
     }
-    pthread_mutex_unlock(&stats_mutex);
+
+    if (flush_fa) {
+      /* Acquire a GPU device slot. */
+      pthread_mutex_lock(&device_pool_mutex);
+      while (device_pool_count == 0)
+        pthread_cond_wait(&device_pool_cond, &device_pool_mutex);
+      device_pool_count--;
+      dev_slot = device_pool_slots[device_pool_count];
+      pthread_mutex_unlock(&device_pool_mutex);
+
+      /* Copy template args for this device; patch for single-device use. */
+      fa_args = wargs->all_device_args[dev_slot];
+
+      check_false_alarms_worker(wargs->ppi_head, scratch, &fa_args, dev_slot);
+
+      /* Write back the FA kernel cache so the next use of this device slot
+       * reuses the compiled kernel instead of recompiling. */
+      wargs->all_device_args[dev_slot].gpu.fa_context = fa_args.gpu.fa_context;
+      wargs->all_device_args[dev_slot].gpu.fa_queue   = fa_args.gpu.fa_queue;
+      wargs->all_device_args[dev_slot].gpu.fa_program = fa_args.gpu.fa_program;
+      wargs->all_device_args[dev_slot].gpu.fa_kernel  = fa_args.gpu.fa_kernel;
+
+      /* Return the GPU device slot. */
+      pthread_mutex_lock(&device_pool_mutex);
+      device_pool_slots[device_pool_count] = dev_slot;
+      device_pool_count++;
+      pthread_cond_signal(&device_pool_cond);
+      pthread_mutex_unlock(&device_pool_mutex);
+
+      /* Check all_cracked after FA (which is where new cracks are registered). */
+      pthread_mutex_lock(&stats_mutex);
+      if (num_cracked >= num_hashes && num_hashes > 0)
+        all_cracked = 1;
+      pthread_mutex_unlock(&stats_mutex);
+
+      clear_worker_scratch(scratch);
+      tables_in_scratch = 0;
+    }
+
+    if (pt == NULL) break;
   }
 
   free_worker_scratch(scratch);
@@ -2739,6 +2793,12 @@ int main(int ac, char **av) {
       args[i].gpu.tuned_gws = autotune_precompute_gws(&args[i]);
       args[i].hash = NULL;
     }
+  }
+
+  /* Pre-warm the FA kernel on every device to JIT-compile it now, eliminating
+   * the ~11.5 s compilation delay that would otherwise hit the first table. */
+  for (i = 0; i < num_devices; i++) {
+    prewarm_fa_kernel(&args[i]);
   }
 
   num_hashes_precomputed_total = num_hashes;

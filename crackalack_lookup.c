@@ -314,6 +314,10 @@ unsigned int device_pool_count = 0;
 unsigned int all_cracked = 0;
 unsigned int stop_preloading = 0;
 
+/* Running count of tables successfully added to the preload buffer; used for
+ * diagnostic logging only. */
+unsigned int tables_preloaded_count = 0;
+
 
 worker_scratch *alloc_worker_scratch(precomputed_and_potential_indices *ppi_head) {
   worker_scratch *scratch = NULL;
@@ -1733,14 +1737,19 @@ void _preloading_thread(char *rt_dir) {
   struct dirent *de = NULL;
   struct stat st;
   char filepath[512];
+  unsigned int local_tables = 0, local_dirs = 0, local_skipped = 0;
 
 
   memset(&st, 0, sizeof(st));
   memset(filepath, 0, sizeof(filepath));
 
+  fprintf(stderr, "[preloader] Scanning: %s\n", rt_dir);  fflush(stderr);
+
   dir = opendir(rt_dir);
-  if (dir == NULL)  /* This directory may not allow the current process permission. */
+  if (dir == NULL) {  /* This directory may not allow the current process permission. */
+    fprintf(stderr, "[preloader] opendir failed for %s: %s\n", rt_dir, strerror(errno));  fflush(stderr);
     return;
+  }
 
   while ((de = readdir(dir)) != NULL) {
     if (stop_preloading) break;
@@ -1750,6 +1759,7 @@ void _preloading_thread(char *rt_dir) {
 
     /* If this is a directory, recurse into it. */
     if ((strcmp(de->d_name, ".") != 0) && (strcmp(de->d_name, "..") != 0) && (stat(filepath, &st) == 0) && S_ISDIR(st.st_mode)) {
+      local_dirs++;
       _preloading_thread(filepath);
 
     /* If this is a compressed or uncompressed rainbow table, load it! */
@@ -1812,6 +1822,7 @@ void _preloading_thread(char *rt_dir) {
 	    fprintf(stderr, "\nError: %s is not a valid table suitable for lookups!  (Hint: it may not be sorted.)  Skipping...\n\n", filepath);  fflush(stderr);
 	    FREE(rainbow_table);
 	    skip_table = 1; /* Skip further processing on this table only. */
+	    local_skipped++;
 	  }
 	}
 
@@ -1852,6 +1863,7 @@ void _preloading_thread(char *rt_dir) {
 	  while ((num_preloaded_tables_available >= max_preload_num) && !stop_preloading)
 	    pthread_cond_wait(&condition_continue_loading_tables, &preloaded_tables_lock);
 	  if (stop_preloading) {
+	    fprintf(stderr, "[preloader] stop_preloading set mid-wait in %s (%u loaded, %u subdirs, %u skipped)\n", rt_dir, local_tables, local_dirs, local_skipped);  fflush(stderr);
 	    pthread_mutex_unlock(&preloaded_tables_lock);
 	    closedir(dir); dir = NULL;
 	    return;
@@ -1859,10 +1871,22 @@ void _preloading_thread(char *rt_dir) {
 
 	  /* Release the preloading system lock. */
 	  pthread_mutex_unlock(&preloaded_tables_lock);
+	  local_tables++;
+	  tables_preloaded_count++;
 	}
       }
+    } else if ((strcmp(de->d_name, ".") != 0) && (strcmp(de->d_name, "..") != 0) &&
+               !str_ends_with(de->d_name, ".rt") && !str_ends_with(de->d_name, ".rtc")) {
+      /* Entry that is neither a directory (by stat) nor a .rt/.rtc file — could be a
+       * symlink-to-directory whose name doesn't end in .rt, or an unrelated file. */
     }
   }
+
+  if (stop_preloading)
+    fprintf(stderr, "[preloader] stop_preloading set, exiting early from %s (%u loaded, %u subdirs, %u skipped)\n", rt_dir, local_tables, local_dirs, local_skipped);
+  else
+    fprintf(stderr, "[preloader] Finished %s: %u tables loaded, %u subdirs visited, %u skipped\n", rt_dir, local_tables, local_dirs, local_skipped);
+  fflush(stderr);
 
   closedir(dir); dir = NULL;
 }
@@ -1882,6 +1906,7 @@ void *preloading_thread(void *ptr) {
   free(xrt_dir); xrt_dir = ((preloading_thread_args *)ptr)->rt_dir = NULL;
 
   _preloading_thread(rt_dir);
+  fprintf(stderr, "[preloader] Preloading complete: %u tables total. Setting table_loading_complete=1.\n", tables_preloaded_count);  fflush(stderr);
 
   /* We've reached the end of all the tables, so tell the main thread. */
   table_loading_complete = 1;
@@ -2370,11 +2395,15 @@ void search_tables(unsigned int total_tables, precomputed_and_potential_indices 
   unsigned int bs_threads = num_cores / W;
   if (bs_threads < 1) bs_threads = 1;
 
-  /* Keep one table per worker plus one spare in the preload buffer so every
-   * worker can immediately start BS after finishing an FA check.  A smaller
-   * buffer (e.g. num_devices+1) starves the GPU queue: workers stall waiting
-   * for the preloader, leaving GPUs idle between jobs. */
-  max_preload_num = W + 1;
+  /* Size the preload buffer so every worker can have FA_BATCH_SIZE tables in
+   * its scratch plus one spare per worker.  W+1 was too small: with 8 workers
+   * and FA_BATCH_SIZE=4, workers stall waiting for the preloader before they
+   * can fill a full batch. */
+  max_preload_num = W * FA_BATCH_SIZE + 1;
+  /* Wake the preloader in case it's already blocked on the old (smaller) limit. */
+  pthread_mutex_lock(&preloaded_tables_lock);
+  pthread_cond_signal(&condition_continue_loading_tables);
+  pthread_mutex_unlock(&preloaded_tables_lock);
 
   /* Populate the device pool with all device indices. */
   pthread_mutex_lock(&device_pool_mutex);
@@ -2821,6 +2850,17 @@ int main(int ac, char **av) {
    * user.  Strange crashes in the OpenCL functions can occur when memory is exhausted,
    * and its not obvious that this is the culprit. */
   check_memory_usage();
+
+  /* Set max_preload_num before starting the preloader so it doesn't block after
+   * only 2 tables.  search_tables() will recalculate with the exact W, but this
+   * estimate prevents unnecessary early stalling. */
+  {
+    unsigned int est_cores = get_num_cpu_cores();
+    unsigned int est_W = est_cores / 2;
+    if (est_W < 2) est_W = 2;
+    if (est_W > 8) est_W = 8;
+    max_preload_num = est_W * FA_BATCH_SIZE + 1;
+  }
 
   /* Start preloading tables into memory. */
   preload_thread_args.rt_dir = strdup(rt_dir);

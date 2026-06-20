@@ -1743,7 +1743,7 @@ void _preloading_thread(char *rt_dir) {
   memset(&st, 0, sizeof(st));
   memset(filepath, 0, sizeof(filepath));
 
-  fprintf(stderr, "[preloader] Scanning: %s\n", rt_dir);  fflush(stderr);
+  fprintf(stderr, "[preloader] Scanning: %s (max_preload_num=%u)\n", rt_dir, max_preload_num);  fflush(stderr);
 
   dir = opendir(rt_dir);
   if (dir == NULL) {  /* This directory may not allow the current process permission. */
@@ -1913,10 +1913,8 @@ void *preloading_thread(void *ptr) {
   fprintf(stderr, "[preloader] Preloading complete: %u tables total. Setting table_loading_complete=1.\n", tables_preloaded_count);  fflush(stderr);
 
   /* We've reached the end of all the tables, so tell the main thread. */
-  table_loading_complete = 1;
-
-  /* If the main thread is still waiting on new tables, wake it up. */
   pthread_mutex_lock(&preloaded_tables_lock);
+  table_loading_complete = 1;
   pthread_cond_broadcast(&condition_wait_for_tables);
   pthread_mutex_unlock(&preloaded_tables_lock);
   return NULL;
@@ -2265,11 +2263,20 @@ preloaded_table *get_preloaded_table() {
   pthread_mutex_lock(&preloaded_tables_lock);
 
   /* If no tables have been preloaded yet, wait until at least one becomes available. */
-  while ((num_preloaded_tables_available == 0) && (table_loading_complete == 0))
+  while ((num_preloaded_tables_available == 0) && (table_loading_complete == 0)) {
+    fprintf(stderr, "[get_table] Waiting: available=%u tlc=%u\n",
+            num_preloaded_tables_available, table_loading_complete);  fflush(stderr);
     pthread_cond_wait(&condition_wait_for_tables, &preloaded_tables_lock);
+    fprintf(stderr, "[get_table] Woke: available=%u tlc=%u\n",
+            num_preloaded_tables_available, table_loading_complete);  fflush(stderr);
+  }
 
   /* Return the head of the list. */
   ret = preloaded_table_list;
+  if (ret == NULL)
+    fprintf(stderr, "[get_table] Returning NULL: available=%u tlc=%u list=%s\n",
+            num_preloaded_tables_available, table_loading_complete,
+            preloaded_table_list == NULL ? "empty" : "non-empty");  fflush(stderr);
 
   /* If the head of the list isn't NULL, advance it by one. */
   if (preloaded_table_list != NULL) {

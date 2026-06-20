@@ -800,10 +800,18 @@ unsigned int count_tables(char *dir) {
       is_dir = S_ISDIR(st.st_mode);
     }
 #else
-    /* Linux has the d_type field, which is much more efficient to use than doing
-     * another stat(). */
-    is_file = (de->d_type == DT_REG) || (de->d_type == DT_LNK);
-    is_dir = (de->d_type == DT_DIR);
+    {
+      struct stat _st = {0};
+      char _path[1024] = {0};
+      filepath_join(_path, sizeof(_path), dir, de->d_name);
+      if (stat(_path, &_st) < 0) {
+        is_file = 0;
+        is_dir  = 0;
+      } else {
+        is_file = S_ISREG(_st.st_mode);
+        is_dir  = S_ISDIR(_st.st_mode);
+      }
+    }
 #endif
 
     if (is_file && (str_ends_with(de->d_name, ".rt") || str_ends_with(de->d_name, ".rtc")))
@@ -1737,7 +1745,7 @@ void _preloading_thread(char *rt_dir) {
   struct dirent *de = NULL;
   struct stat st;
   char filepath[512];
-  unsigned int local_tables = 0, local_dirs = 0, local_skipped = 0;
+  unsigned int local_tables = 0, local_dirs = 0, local_skipped = 0, local_failed = 0;
 
 
   memset(&st, 0, sizeof(st));
@@ -1758,7 +1766,9 @@ void _preloading_thread(char *rt_dir) {
     filepath_join(filepath, sizeof(filepath), rt_dir, de->d_name);
 
     /* If this is a directory, recurse into it. */
-    if ((strcmp(de->d_name, ".") != 0) && (strcmp(de->d_name, "..") != 0) && (stat(filepath, &st) == 0) && S_ISDIR(st.st_mode)) {
+    if ((strcmp(de->d_name, ".") != 0) && (strcmp(de->d_name, "..") != 0) &&
+        (stat(filepath, &st) != 0 ? (fprintf(stderr, "[preloader] stat failed: %s (%s)\n", filepath, strerror(errno)), fflush(stderr), 0) : 1) &&
+        S_ISDIR(st.st_mode)) {
       local_dirs++;
       _preloading_thread(filepath);
 
@@ -1803,12 +1813,16 @@ void _preloading_thread(char *rt_dir) {
 
 	    time_io += get_elapsed(&start_time_io);
 	    num_chains = num_longs / 2;
-	  } else
-	    fprintf(stderr, "Rainbow table size is not a multiple of %"PRIu64": %ld\n", sizeof(cl_ulong) * 2, file_size);
+	  } else {
+	    fprintf(stderr, "[preloader] Bad size (%ld) for: %s\n", file_size, filepath);  fflush(stderr);
+	    local_failed++;
+	  }
 
 	  FCLOSE(f);
-	} else
-	  fprintf(stderr, "Could not open file for reading: %s", strerror(errno));
+	} else {
+	  fprintf(stderr, "[preloader] fopen failed: %s (%s)\n", filepath, strerror(errno));  fflush(stderr);
+	  local_failed++;
+	}
       }
 
       if (rainbow_table != NULL) {
@@ -1867,7 +1881,7 @@ void _preloading_thread(char *rt_dir) {
 	  while ((num_preloaded_tables_available >= max_preload_num) && !stop_preloading)
 	    pthread_cond_wait(&condition_continue_loading_tables, &preloaded_tables_lock);
 	  if (stop_preloading) {
-	    fprintf(stderr, "[preloader] stop_preloading set mid-wait in %s (%u loaded, %u subdirs, %u skipped)\n", rt_dir, local_tables, local_dirs, local_skipped);  fflush(stderr);
+	    fprintf(stderr, "[preloader] stop_preloading set mid-wait in %s (%u loaded, %u subdirs, %u skipped, %u failed)\n", rt_dir, local_tables, local_dirs, local_skipped, local_failed);  fflush(stderr);
 	    pthread_mutex_unlock(&preloaded_tables_lock);
 	    closedir(dir); dir = NULL;
 	    return;
@@ -1887,9 +1901,9 @@ void _preloading_thread(char *rt_dir) {
   }
 
   if (stop_preloading)
-    fprintf(stderr, "[preloader] stop_preloading set, exiting early from %s (%u loaded, %u subdirs, %u skipped)\n", rt_dir, local_tables, local_dirs, local_skipped);
+    fprintf(stderr, "[preloader] stop_preloading set, exiting early from %s (%u loaded, %u subdirs, %u skipped, %u failed)\n", rt_dir, local_tables, local_dirs, local_skipped, local_failed);
   else
-    fprintf(stderr, "[preloader] Finished %s: %u tables loaded, %u subdirs visited, %u skipped\n", rt_dir, local_tables, local_dirs, local_skipped);
+    fprintf(stderr, "[preloader] Finished %s: %u tables loaded, %u subdirs, %u skipped, %u failed\n", rt_dir, local_tables, local_dirs, local_skipped, local_failed);
   fflush(stderr);
 
   closedir(dir); dir = NULL;

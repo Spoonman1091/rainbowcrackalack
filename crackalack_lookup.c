@@ -647,6 +647,7 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
   fa_args->potential_start_index_positions = potential_start_index_positions;
   fa_args->hash_base_indices = hash_base_indices;
 
+  double fa_start_abs = get_elapsed(&search_start_time);
   start_timer(&start_time);
 
   if (pthread_create(&fa_thread, NULL, &host_thread_false_alarm, fa_args)) {
@@ -716,7 +717,7 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
   pthread_mutex_unlock(&stats_mutex);
 
   seconds_to_human_time(time_str, sizeof(time_str), (unsigned int)time_delta);
-  printf("  [GPU #%u] Completed false alarm checks in %s.\n", dev_slot, time_str);  fflush(stdout);
+  printf("  [GPU #%u] FA started at %.1fs, completed in %s.\n", dev_slot, fa_start_abs, time_str);  fflush(stdout);
 
   FREE(potential_start_indices);
   FREE(potential_start_index_positions);

@@ -1860,6 +1860,10 @@ void _preloading_thread(char *rt_dir) {
 
 	  /* If we preloaded the maximum number of tables, wait for the main thread to consume at least one
 	   * before preloading more. */
+	  if ((num_preloaded_tables_available >= max_preload_num) && !stop_preloading) {
+	    fprintf(stderr, "[preloader] Buffer full: available=%u >= max_preload_num=%u, blocking (local_tables=%u)\n",
+	            num_preloaded_tables_available, max_preload_num, local_tables);  fflush(stderr);
+	  }
 	  while ((num_preloaded_tables_available >= max_preload_num) && !stop_preloading)
 	    pthread_cond_wait(&condition_continue_loading_tables, &preloaded_tables_lock);
 	  if (stop_preloading) {
@@ -2301,7 +2305,10 @@ void *table_worker_thread(void *ptr) {
     int flush_fa = 0;
 
     pthread_mutex_lock(&stats_mutex);
-    if (all_cracked) { pthread_mutex_unlock(&stats_mutex); break; }
+    if (all_cracked) {
+      fprintf(stderr, "[worker %u] Exiting: all_cracked was set\n", wargs->worker_id);  fflush(stderr);
+      pthread_mutex_unlock(&stats_mutex); break;
+    }
     pthread_mutex_unlock(&stats_mutex);
 
     pt = get_preloaded_table();
@@ -2371,7 +2378,10 @@ void *table_worker_thread(void *ptr) {
       tables_in_scratch = 0;
     }
 
-    if (pt == NULL) break;
+    if (pt == NULL) {
+      fprintf(stderr, "[worker %u] Exiting: get_preloaded_table() returned NULL\n", wargs->worker_id);  fflush(stderr);
+      break;
+    }
   }
 
   free_worker_scratch(scratch);

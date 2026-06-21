@@ -162,6 +162,7 @@ $(OUTDIR)/$(LOOKUP_PROG): \
 	$(OBJDIR)/file_lock.o \
 	$(OBJDIR)/hash_validate.o \
 	$(OBJDIR)/misc.o \
+	$(OBJDIR)/ntlmv1.o \
 	$(OBJDIR)/opencl_setup.o \
 	$(OBJDIR)/rtc_decompress.o \
 	$(OBJDIR)/test_shared.o \

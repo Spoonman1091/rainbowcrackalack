@@ -45,6 +45,7 @@
 #include "cpu_rt_functions.h"
 #include "hash_validate.h"
 #include "misc.h"
+#include "ntlmv1.h"
 #include "rtc_decompress.h"
 #include "shared.h"
 #include "test_shared.h"  /* TODO: move hex_to_bytes() elsewhere. */
@@ -84,6 +85,8 @@ struct _precomputed_and_potential_indices {
   unsigned int *potential_start_index_positions; /* Buffer size is always num_potential_start_indices. */
 
   char *plaintext;        /* Set if hash is cracked. */
+  unsigned char cracked_key[8];   /* raw recovered plaintext bytes (netntlmv1: 7 key bytes) */
+  unsigned int  cracked_key_len;  /* 0 until cracked */
   char *index_filename;   /* File path containing the ".index" file. */
   struct _precomputed_and_potential_indices *next;
 };
@@ -313,6 +316,9 @@ unsigned int device_pool_count = 0;
 
 unsigned int all_cracked = 0;
 unsigned int stop_preloading = 0;
+
+int ntlmv1_mode = 0;
+char *ntlmv1_capture_arg = NULL;
 
 /* Running count of tables successfully added to the preload buffer; used for
  * diagnostic logging only. */
@@ -548,6 +554,9 @@ void check_false_alarms(precomputed_and_potential_indices *ppi, thread_args *arg
       	 * no longer useful, save the hash/plaintext combo into the pot file, and
       	 * tell the user. */
       	ppi_refs[j]->plaintext = strdup(plaintext);
+      	ppi_refs[j]->cracked_key_len = (plaintext_len < (unsigned int)sizeof(ppi_refs[j]->cracked_key))
+      	    ? plaintext_len : (unsigned int)sizeof(ppi_refs[j]->cracked_key);
+      	memcpy(ppi_refs[j]->cracked_key, plaintext, ppi_refs[j]->cracked_key_len);
       	ppi_refs[j]->num_precomputed_end_indices = 0;
       	FREE(ppi_refs[j]->precomputed_end_indices);
 
@@ -699,6 +708,9 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
       LOCK_PPI();
       if (ppi_refs[j]->plaintext == NULL) {
         ppi_refs[j]->plaintext = strdup(plaintext);
+        ppi_refs[j]->cracked_key_len = (plaintext_len < (unsigned int)sizeof(ppi_refs[j]->cracked_key))
+            ? plaintext_len : (unsigned int)sizeof(ppi_refs[j]->cracked_key);
+        memcpy(ppi_refs[j]->cracked_key, plaintext, ppi_refs[j]->cracked_key_len);
         ppi_refs[j]->num_precomputed_end_indices = 0;
         FREE(ppi_refs[j]->precomputed_end_indices);
       }
@@ -1995,7 +2007,7 @@ void print_usage_and_exit(char *prog_name, int exit_code) {
   char *dir2 = "/home/user/";
 #endif
 
-  fprintf(stderr, "%sUsage:%s %s rainbow_table_directory (single_hash | filename_with_many_hashes.txt) [-gws GWS] [-disable-platform N]\n\n", WHITEB, CLR, prog_name);
+  fprintf(stderr, "%sUsage:%s %s rainbow_table_directory ( single_hash | filename_with_many_hashes.txt | -ntlmv1 full_capture ) [-gws GWS] [-disable-platform N]\n\n", WHITEB, CLR, prog_name);
   fprintf(stderr, "    %s-gws GWS%s    (Optional) Sets the global work size for each GPU.  This can significantly affect the speed.  To tune this setting, start with multiplying the max compute units by the max work group size (both are reported on program start-up).  Then increase/decrease the value and time the results.  For example, if the max compute units is 20, and the max work group size is 1024, try using 20 x 1024 = 20480, then 20480 - 1024 = 19456, 20480 - 2048 = 18432, 2048 + 1024 = 21504, etc.  If you find a value that works better than the automatic setting, please report your findings at: https://github.com/jtesta/rainbowcrackalack/issues\n\n", WHITEB, CLR);
   fprintf(stderr, "    %s-disable-platform N%s    (Optional) Disables a platform from being used (platform numbers are reported on program start-up).  Useful when experiencing strange problems on mixed-GPU systems.  Try disabling each platform one at a time and see if the program behaves normally.\n\n\n", WHITEB, CLR);
   fprintf(stderr, "%sExamples:%s\n    %s %s 64f12cddaa88057e06a81b54e73b949b\n    %s %s %shashes_one_per_line.txt\n    %s %s %spwdump.txt\n\n", WHITEB, CLR, prog_name, dir1, prog_name, dir1, dir2, prog_name, dir1, dir2);
@@ -2523,21 +2535,50 @@ int main(int ac, char **av) {
 
   pthread_t preload_thread_id = {0};
   preloading_thread_args preload_thread_args = {0};
+  ntlmv1_capture parsed_capture = {0};
 
 
   ENABLE_CONSOLE_COLOR();
   PRINT_PROJECT_HEADER();
   setlocale(LC_NUMERIC, "");
-  if ((ac < 3) || (ac > 5))
-    print_usage_and_exit(av[0], -1);
-  else if ((ac == 5) && (strcmp(av[3], "-gws") != 0) && (strcmp(av[3], "-disable-platform") != 0))
-    print_usage_and_exit(av[0], -1);
+  /* Scan for flag-style arguments: -ntlmv1, -gws, -disable-platform. */
+  for (i = 2; (int)i < ac; i++) {
+    if (strcmp(av[i], "-ntlmv1") == 0) {
+      ntlmv1_mode = 1;
+      if ((int)(i + 1) < ac)
+        ntlmv1_capture_arg = av[++i];
+    } else if (strcmp(av[i], "-gws") == 0) {
+      if ((int)(i + 1) < ac)
+        user_provided_gws = (unsigned int)atoi(av[++i]);
+    } else if (strcmp(av[i], "-disable-platform") == 0) {
+      if ((int)(i + 1) < ac)
+        disable_platform = (unsigned int)atoi(av[++i]);
+    }
+  }
 
-  if (ac == 5) {
-    if (strcmp(av[3], "-gws") == 0)
-      user_provided_gws = (unsigned int)atoi(av[4]);
-    else if (strcmp(av[3], "-disable-platform") == 0)
-      disable_platform = (unsigned int)atoi(av[4]);
+  if (ntlmv1_mode) {
+    if (ac < 4 || ntlmv1_capture_arg == NULL)
+      print_usage_and_exit(av[0], -1);
+  } else {
+    if ((ac < 3) || (ac > 5))
+      print_usage_and_exit(av[0], -1);
+    else if ((ac == 5) && (strcmp(av[3], "-gws") != 0) && (strcmp(av[3], "-disable-platform") != 0))
+      print_usage_and_exit(av[0], -1);
+  }
+
+  /* In ntlmv1 mode, validate the capture before any GPU work. */
+  if (ntlmv1_mode) {
+    int parse_ret = ntlmv1_parse_capture(ntlmv1_capture_arg, &parsed_capture);
+    if (parse_ret == NTLMV1_ERR_FORMAT) {
+      fprintf(stderr, "Error: invalid NTLMv1 capture format.\n  Expected: user::domain:LMresp48hex:NTresp48hex:challenge16hex\n");
+      exit(-1);
+    } else if (parse_ret == NTLMV1_ERR_CHALLENGE) {
+      fprintf(stderr, "Error: challenge is not 1122334455667788.\n  NTLMv1 rainbow tables require the fixed challenge; this capture cannot be cracked with tables.\n");
+      exit(1);
+    } else if (parse_ret == NTLMV1_ERR_ESS) {
+      fprintf(stderr, "Error: ESS (Extended Session Security / NTLMv1-SSP) detected.\n  The LM response indicates a non-fixed challenge; this capture cannot be cracked with rainbow tables.\n");
+      exit(1);
+    }
   }
 
   /* Initialize the devices. */
@@ -2573,7 +2614,7 @@ int main(int ac, char **av) {
 
   /* The default rainbowcrackalack.pot file can be overridden with a third argument.
    * This is undocumented since its probably only useful for automated testing. */
-  if (ac == 4) {
+  if (!ntlmv1_mode && ac == 4) {
     strncpy(jtr_pot_filename, av[3], sizeof(jtr_pot_filename) - 1);
     jtr_pot_filename[sizeof(jtr_pot_filename) - 1] = '\0';
     strncpy(hashcat_pot_filename, av[3], sizeof(hashcat_pot_filename) - 1);
@@ -2608,7 +2649,9 @@ int main(int ac, char **av) {
 
   FCLOSE(f);
 
-  /* Check if the second arg is a hash or a file containing hashes. */
+  /* Check if the second arg is a hash or a file containing hashes.
+   * Skipped in ntlmv1 mode where av[2] is the -ntlmv1 flag, not a hash. */
+  if (!ntlmv1_mode) {
   if (stat(av[2], &st) == 0)
     filename = av[2];
   else {
@@ -2799,6 +2842,18 @@ int main(int ac, char **av) {
     hashes[0] = strdup(single_hash);
     num_hashes = 1;
   }
+  } else { /* ntlmv1 mode: inject two block hashes */
+    usernames = calloc(2, sizeof(char *));
+    hashes = calloc(2, sizeof(char *));
+    if ((usernames == NULL) || (hashes == NULL)) {
+      fprintf(stderr, "Error while allocating buffer for hashes.\n");
+      goto err;
+    }
+    usernames[0] = usernames[1] = NULL;
+    hashes[0] = strdup(parsed_capture.block1_hex);
+    hashes[1] = strdup(parsed_capture.block2_hex);
+    num_hashes = 2;
+  }
 
   /* We're done checking the pot file for previously-cracked hashes. */
   FREE(pot_file_data);
@@ -2811,12 +2866,17 @@ int main(int ac, char **av) {
     exit(-1);
   }
 
-  /* At this time, only NTLM hashes are supported. 
+  /* At this time, only NTLM hashes are supported.
   if (rt_params.hash_type != HASH_NTLM) {
     fprintf(stderr, "Unfortunately, only NTLM hashes are supported at this time.  Terminating.\n");
     exit(-1);
   }
   */
+
+  if (ntlmv1_mode && rt_params.hash_type != HASH_NETNTLMV1) {
+    fprintf(stderr, "Error: -ntlmv1 requires netntlmv1 rainbow tables (found hash type %u in %s).\n", rt_params.hash_type, rt_dir);
+    exit(-1);
+  }
 
   /* Ensure that valid hashes were provided. */
   if (rt_params.hash_type == HASH_NTLM) {
@@ -2923,6 +2983,77 @@ int main(int ac, char **av) {
 
   /* Join the preload thread (it may still be running if we exited early). */
   pthread_join(preload_thread_id, NULL);
+
+  /* NTLMv1 reassembly: match recovered block keys and assemble the full NT hash. */
+  if (ntlmv1_mode) {
+    unsigned char k1[7] = {0}, k2[7] = {0};
+    int k1_found = 0, k2_found = 0;
+    int same_block = (strcmp(parsed_capture.block1_hex, parsed_capture.block2_hex) == 0);
+
+    ppi_cur = ppi_head;
+    while (ppi_cur != NULL) {
+      if (ppi_cur->cracked_key_len > 0) {
+        if (strcmp(ppi_cur->hash, parsed_capture.block1_hex) == 0) {
+          memcpy(k1, ppi_cur->cracked_key, 7);
+          k1_found = 1;
+          if (same_block) {
+            memcpy(k2, ppi_cur->cracked_key, 7);
+            k2_found = 1;
+          }
+        }
+        if (!same_block && strcmp(ppi_cur->hash, parsed_capture.block2_hex) == 0) {
+          memcpy(k2, ppi_cur->cracked_key, 7);
+          k2_found = 1;
+        }
+      }
+      ppi_cur = ppi_cur->next;
+    }
+
+    if (!k1_found || !k2_found) {
+      printf("\nPartial NTLMv1 crack:\n");
+      if (k1_found) {
+        char hex[15] = {0};
+        bytes_to_hex(k1, 7, hex, sizeof(hex));
+        printf("  Block 1 (%s): %s\n", parsed_capture.block1_hex, hex);
+      } else {
+        printf("  Block 1 (%s): NOT FOUND in tables\n", parsed_capture.block1_hex);
+      }
+      if (k2_found) {
+        char hex[15] = {0};
+        bytes_to_hex(k2, 7, hex, sizeof(hex));
+        printf("  Block 2 (%s): %s\n", parsed_capture.block2_hex, hex);
+      } else {
+        printf("  Block 2 (%s): NOT FOUND in tables\n", parsed_capture.block2_hex);
+      }
+      printf("  Full NT hash cannot be assembled.\n");
+    } else {
+      unsigned char last2[2] = {0};
+      unsigned int found_count = 0;
+      int ok = ntlmv1_recover_last2(parsed_capture.block3, last2, &found_count);
+      if (!ok || found_count == 0) {
+        printf("\nCould not brute-force block3; capture may be malformed.\n");
+      } else {
+        unsigned char ntlm16[16] = {0};
+        char ntlm_hex[33] = {0};
+
+        if (found_count > 1)
+          printf("\nWarning: block3 brute-force produced %u collisions; using first match.\n", found_count);
+
+        ntlmv1_assemble(k1, k2, last2, ntlm16);
+        bytes_to_hex(ntlm16, 16, ntlm_hex, sizeof(ntlm_hex));
+
+        printf("\n%sRecovered NT hash: %s%s\n", GREENB, ntlm_hex, CLR);
+        printf("%s%s:::%s:::%s\n", GREENB, parsed_capture.username, ntlm_hex, CLR);
+        fflush(stdout);
+      }
+    }
+
+    free_precomputed_and_potential_indices(&ppi_head);
+    free_loaded_hashes(usernames, hashes);
+    FREE(args);
+    pthread_barrier_destroy(&barrier);
+    return 0;
+  }
 
   seconds_to_human_time(time_precomp_str, sizeof(time_precomp_str), time_precomp);
   seconds_to_human_time(time_io_str, sizeof(time_io_str), time_io);

@@ -309,8 +309,16 @@ void netntlmv1_hash(unsigned char *plaintext, unsigned int plaintext_len, unsign
     gcry_cipher_hd_t handle;
     gcry_error_t err;
 
-    // Define key and plaintext
+    // Fixed 8-byte challenge used for all netntlmv1 hashes.
     unsigned char magic[KEY_SIZE] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+
+    // Expand the 7-byte plaintext to an 8-byte DES key (parity bits zeroed).
+    // This matches des_ecb_setkey_56() in CL/netntlmv1.cl, which is what the
+    // GPU uses when generating chains.  Without this expansion gcry_cipher_setkey
+    // would receive a 7-byte key and return GPG_ERR_INV_KEYLEN, causing the
+    // function to return early and leave 'hash' unwritten.
+    unsigned char des_key[KEY_SIZE];
+    setup_des_key((char *)plaintext, des_key);
 
     // Open cipher context
     err = gcry_cipher_open(&handle, GCRY_CIPHER, GCRY_MODE, 0);
@@ -319,15 +327,15 @@ void netntlmv1_hash(unsigned char *plaintext, unsigned int plaintext_len, unsign
         return;
     }
 
-    // Set the key for encryption
-    err = gcry_cipher_setkey(handle, plaintext, plaintext_len);
+    // Set the expanded 8-byte DES key
+    err = gcry_cipher_setkey(handle, des_key, KEY_SIZE);
     if (err) {
         fprintf(stderr, "Failed to set key: %s\n", gcry_strerror(err));
         gcry_cipher_close(handle);
         return;
     }
 
-    // Encrypt the plaintext
+    // Encrypt the challenge
     err = gcry_cipher_encrypt(handle, hash, BLOCK_SIZE, magic, BLOCK_SIZE);
     if (err) {
         fprintf(stderr, "Encryption failed: %s\n", gcry_strerror(err));

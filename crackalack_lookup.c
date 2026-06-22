@@ -513,7 +513,6 @@ void check_false_alarms(precomputed_and_potential_indices *ppi, thread_args *arg
       if (args[i].results[j] != 0) {
       	char plaintext[MAX_PLAINTEXT_LEN] = {0};
       	unsigned int plaintext_len = 0;
-        unsigned char real_key[8] = {0};
 
 
       	index_to_plaintext(args[i].results[j], args[i].charset, charset_len, args[i].plaintext_len_min, args[i].plaintext_len_max, plaintext_space_up_to_index, plaintext, &plaintext_len);
@@ -534,16 +533,12 @@ void check_false_alarms(precomputed_and_potential_indices *ppi, thread_args *arg
 
           unsigned char hash[8] = {0};
           char hash_hex[(sizeof(hash) * 2) + 1] = {0};
-          char rkey_hex[(sizeof(hash) * 2) + 1] = {0};
 
-          setup_des_key(plaintext, real_key);
-
-          netntlmv1_hash(real_key, 8, hash);
+          netntlmv1_hash((unsigned char *)plaintext, plaintext_len, hash);
 
           if (!bytes_to_hex(hash, sizeof(hash), hash_hex, sizeof(hash_hex)) || \
               (strncmp(hash_hex, ppi_refs[j]->hash, 16) != 0)) {
-                bytes_to_hex(real_key, sizeof(real_key), rkey_hex, sizeof(rkey_hex));
-                printf("Found super false positive!: (Net-NTLMv1('%s') == %s) != %s\n", rkey_hex, hash_hex, ppi_refs[j]->hash);
+                printf("Found super false positive!: (Net-NTLMv1('%s') == %s) != %s\n", plaintext, hash_hex, ppi_refs[j]->hash);
             continue;
           }
         } else {
@@ -1466,7 +1461,8 @@ void *host_thread_precompute(void *ptr) {
   CLCREATEARG(4, plaintext_len_min_buffer, CL_RO, args->plaintext_len_min, sizeof(cl_uint));
   CLCREATEARG(5, plaintext_len_max_buffer, CL_RO, args->plaintext_len_max, sizeof(cl_uint));
   CLCREATEARG(6, table_index_buffer, CL_RO, args->table_index, sizeof(cl_uint));
-  CLCREATEARG(7, chain_len_buffer, CL_RO, args->chain_len, sizeof(cl_ulong));
+  cl_ulong chain_len_ulong = (cl_ulong)args->chain_len;
+  CLCREATEARG(7, chain_len_buffer, CL_RO, chain_len_ulong, sizeof(cl_ulong));
   CLCREATEARG(8, device_num_buffer, CL_RO, gpu->device_number, sizeof(cl_uint));
   CLCREATEARG(9, total_devices_buffer, CL_RO, args->total_devices, sizeof(cl_uint));
   CLCREATEARG_ARRAY(11, output_block_buffer, CL_WO, output_block, output_block_len * sizeof(cl_ulong));

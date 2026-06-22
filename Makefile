@@ -211,8 +211,18 @@ bundle_windows:
 		done; \
 	done
 
+TEST_LAZY_PROG := test_lazy_accessor$(EXE)
+
+.PHONY: test_lazy
+test_lazy: $(OUTDIR)/$(TEST_LAZY_PROG)
+	./$(OUTDIR)/$(TEST_LAZY_PROG)
+
+$(OUTDIR)/$(TEST_LAZY_PROG): test_lazy_accessor.c rtc_decompress.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 clean:
 	rm -rf build
 	rm -f *.exe \
 	      crackalack_gen crackalack_unit_tests get_chain crackalack_verify crackalack_rtc2rt crackalack_lookup perfectify enumerate_chain \
+	      test_lazy_accessor \
 	      libgcrypt-20.dll libgpg-error-0.dll libwinpthread-1.dll

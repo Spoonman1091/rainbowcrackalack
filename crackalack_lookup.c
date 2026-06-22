@@ -22,6 +22,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <sys/mman.h>
 #include <sys/sysinfo.h>
 #define O_BINARY 0
 #endif
@@ -159,10 +160,93 @@ typedef struct {
   pthread_mutex_t lock;
 } worker_scratch;
 
+/* -------------------------------------------------------------------------
+ * Format-aware lazy table accessor
+ * -------------------------------------------------------------------------
+ * RT_ACCESS_FULL    – interleaved heap array (existing behaviour, unchanged).
+ * RT_ACCESS_MMAP_RT – file mmap'd as-is; chain k: start at k*16, end at
+ *                     k*16+8 (little-endian uint64).
+ * RT_ACCESS_MMAP_RTC– file mmap'd; decode via header params (no decompress).
+ * ----------------------------------------------------------------------- */
+typedef enum { RT_ACCESS_FULL, RT_ACCESS_MMAP_RT, RT_ACCESS_MMAP_RTC } rt_access_mode;
+
+typedef struct {
+  rt_access_mode mode;
+  unsigned int num_chains;
+  /* RT_ACCESS_FULL only: */
+  cl_ulong *table;               /* interleaved [s0,e0,s1,e1,...] heap buffer */
+  /* RT_ACCESS_MMAP_RT / RT_ACCESS_MMAP_RTC: */
+  const unsigned char *map;      /* mmap base (PROT_READ) */
+  size_t map_len;
+  /* RT_ACCESS_MMAP_RTC decode params (read once from the 32-byte header): */
+  unsigned int header_size;      /* always 32 for current .rtc format */
+  unsigned int chain_size;       /* packed bytes per chain entry */
+  unsigned int s_bits;           /* bits allocated to the start index */
+  uint64_t s_mask;               /* (1 << s_bits) - 1 */
+  uint64_t s_min;                /* uIndexSMin  from header */
+  uint64_t e_min;                /* uIndexEMin  from header */
+  uint64_t e_interval;           /* uIndexEInterval from header */
+} rt_accessor;
+
+/* Decode end index of chain k from an mmap'd .rtc accessor.
+ * Replicates rtc_decompress.c:131 exactly. */
+static inline cl_ulong _rtc_decode_end(const rt_accessor *a, unsigned int k) {
+  uint64_t buf[2] = {0, 0};
+  memcpy(buf, a->map + a->header_size + (size_t)k * a->chain_size, a->chain_size);
+  /* Guard against UB: shifting uint64 by 64 is undefined in C. */
+  uint64_t e_delta;
+  if (a->s_bits == 0)
+    e_delta = buf[0];
+  else if (a->s_bits >= 64)
+    e_delta = buf[1];
+  else
+    e_delta = (buf[0] >> a->s_bits) | (buf[1] << (64u - a->s_bits));
+  return (cl_ulong)(a->e_min + a->e_interval * k + e_delta);
+}
+
+/* Decode start index of chain k from an mmap'd .rtc accessor. */
+static inline cl_ulong _rtc_decode_start(const rt_accessor *a, unsigned int k) {
+  uint64_t buf[2] = {0, 0};
+  memcpy(buf, a->map + a->header_size + (size_t)k * a->chain_size, a->chain_size);
+  return (cl_ulong)((buf[0] & a->s_mask) + a->s_min);
+}
+
+/* Return the end index of chain k (any mode). */
+static inline cl_ulong rt_end(const rt_accessor *a, unsigned int k) {
+  if (a->mode == RT_ACCESS_FULL)
+    return a->table[k * 2 + 1];
+  if (a->mode == RT_ACCESS_MMAP_RT) {
+    uint64_t v; memcpy(&v, a->map + (size_t)k * 16 + 8, 8); return (cl_ulong)v;
+  }
+  return _rtc_decode_end(a, k);
+}
+
+/* Return the start index of chain k (any mode). */
+static inline cl_ulong rt_start(const rt_accessor *a, unsigned int k) {
+  if (a->mode == RT_ACCESS_FULL)
+    return a->table[k * 2];
+  if (a->mode == RT_ACCESS_MMAP_RT) {
+    uint64_t v; memcpy(&v, a->map + (size_t)k * 16, 8); return (cl_ulong)v;
+  }
+  return _rtc_decode_start(a, k);
+}
+
+/* Release all resources held by an accessor (heap buffer or mmap region). */
+static void free_rt_accessor(rt_accessor *a) {
+  if (a->mode == RT_ACCESS_FULL) {
+    FREE(a->table);
+#ifndef _WIN32
+  } else {
+    if (a->map != NULL && a->map != (const unsigned char *)MAP_FAILED)
+      munmap((void *)a->map, a->map_len);
+#endif
+  }
+  memset(a, 0, sizeof(*a));
+}
+
 /* Struct to pass to binary search threads. */
 typedef struct {
-  cl_ulong *rainbow_table;
-  unsigned int num_chains;
+  const rt_accessor *acc;
   precomputed_and_potential_indices *ppi_head;
   unsigned int thread_number;
   unsigned int total_threads;
@@ -173,8 +257,7 @@ typedef struct {
 /* Struct to hold node in linked list of preloaded tables. */
 struct _preloaded_table {
   char *filepath;
-  cl_ulong *rainbow_table;
-  unsigned int num_chains;
+  rt_accessor acc;               /* owns the table (heap or mmap) */
   struct _preloaded_table *next;
 };
 typedef struct _preloaded_table preloaded_table;
@@ -321,6 +404,7 @@ int ntlmv1_mode = 0;
 char *ntlmv1_capture_arg = NULL;
 int ntlmv1_batch_mode = 0;
 char *ntlmv1_file_arg = NULL;
+int trust_sorted = 0;   /* 1 = allow lazy mmap for .rt tables (skip verify scan) */
 
 /* Running count of tables successfully added to the preload buffer; used for
  * diagnostic logging only. */
@@ -1792,83 +1876,193 @@ void _preloading_thread(char *rt_dir) {
 
     /* If this is a compressed or uncompressed rainbow table, load it! */
     } else if (str_ends_with(de->d_name, ".rt") || str_ends_with(de->d_name, ".rtc")) {
-      cl_ulong *rainbow_table = NULL;
-      unsigned int num_chains = 0, is_uncompressed_table = 0;
+      rt_accessor acc;
+      int acc_loaded = 0;
       struct timespec start_time_io = {0};
 
+      memset(&acc, 0, sizeof(acc));
+      start_timer(&start_time_io);
 
       if (str_ends_with(de->d_name, ".rtc")) {
-	int ret = 0;
+        /* .rtc tables are sorted by construction.  Use lazy mmap so only the
+         * ~log2(N) probed chains are ever faulted in.  Falls back to full
+         * rtc_decompress() if mmap is unavailable or the header is invalid. */
+#ifndef _WIN32
+        {
+          int fd = open(filepath, O_RDONLY);
+          if (fd >= 0) {
+            struct stat fst = {0};
+            if (fstat(fd, &fst) == 0 && fst.st_size > 32) {
+              void *map = mmap(NULL, (size_t)fst.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              if (map != MAP_FAILED) {
+                const unsigned char *h = (const unsigned char *)map;
+                unsigned int  uVersion      = 0;
+                unsigned short uSBits = 0, uEBits = 0;
+                uint64_t uSMin = 0, uEMin = 0, uEInterval = 0;
+                memcpy(&uVersion,   h +  0, 4);
+                memcpy(&uSBits,     h +  4, 2);
+                memcpy(&uEBits,     h +  6, 2);
+                memcpy(&uSMin,      h +  8, 8);
+                memcpy(&uEMin,      h + 16, 8);
+                memcpy(&uEInterval, h + 24, 8);
 
-	start_timer(&start_time_io);    /* For loading the table only. */
-	if ((ret = rtc_decompress(filepath, &rainbow_table, &num_chains)) != 0) {
-	  fprintf(stderr, "Error while decompressing RTC table %s: %d\n", filepath, ret);
-	  exit(-1);
-	}
-	time_io += get_elapsed(&start_time_io);
+                if (uVersion != 0x30435452 || uSBits > 64 || uEBits > 64) {
+                  fprintf(stderr, "[preloader] Bad RTC header in %s; falling back to full decompress\n", filepath);  fflush(stderr);
+                  munmap(map, (size_t)fst.st_size);
+                } else {
+                  unsigned int cs = (uSBits + uEBits + 7) / 8;
+                  if (cs == 0 || cs > 16) {
+                    fprintf(stderr, "[preloader] Bad chain_size %u in %s; falling back\n", cs, filepath);  fflush(stderr);
+                    munmap(map, (size_t)fst.st_size);
+                  } else {
+                    /* Parse num_chains from the filename (identical to rtc_decompress). */
+                    unsigned int nc = 0, unused_nc = 0;
+                    const char *fn_ptr = NULL;
+                    unsigned int fi;
+                    for (fi = (unsigned int)strlen(filepath) - 1; fi > 0; fi--)
+                      if (filepath[fi] == 'x') { fn_ptr = filepath + fi + 1; break; }
+                    if (fn_ptr && sscanf(fn_ptr, "%u_%u.rtc", &nc, &unused_nc) == 2 && nc > 0
+                        && (size_t)fst.st_size >= (size_t)32 + (size_t)nc * cs) {
+                      uint64_t smask = 0; unsigned int si;
+                      for (si = 0; si < uSBits; si++) { smask <<= 1; smask |= 1; }
+                      madvise(map, (size_t)fst.st_size, MADV_RANDOM);
+                      acc.mode        = RT_ACCESS_MMAP_RTC;
+                      acc.num_chains  = nc;
+                      acc.map         = (const unsigned char *)map;
+                      acc.map_len     = (size_t)fst.st_size;
+                      acc.header_size = 32;
+                      acc.chain_size  = cs;
+                      acc.s_bits      = uSBits;
+                      acc.s_mask      = smask;
+                      acc.s_min       = uSMin;
+                      acc.e_min       = uEMin;
+                      acc.e_interval  = uEInterval;
+                      acc_loaded = 1;
+                    } else {
+                      fprintf(stderr, "[preloader] Filename parse failed for %s; falling back\n", filepath);  fflush(stderr);
+                      munmap(map, (size_t)fst.st_size);
+                    }
+                  }
+                }
+              } else {
+                fprintf(stderr, "[preloader] mmap failed for %s (%s); falling back\n", filepath, strerror(errno));  fflush(stderr);
+              }
+            }
+            close(fd);
+          }
+        }
+#endif /* !_WIN32 */
+
+        if (!acc_loaded) {
+          /* Fallback: full rtc_decompress() — original behaviour. */
+          cl_ulong *rainbow_table = NULL;
+          unsigned int num_chains = 0;
+          int ret = rtc_decompress(filepath, &rainbow_table, &num_chains);
+          if (ret != 0) {
+            fprintf(stderr, "Error while decompressing RTC table %s: %d\n", filepath, ret);
+            exit(-1);
+          }
+          acc.mode       = RT_ACCESS_FULL;
+          acc.table      = rainbow_table;
+          acc.num_chains = num_chains;
+          acc_loaded = 1;
+        }
+
       } else {
-	FILE *f = NULL;
+        /* .rt table: lazy mmap when -trust-sorted; otherwise full + verify (original). */
+#ifndef _WIN32
+        if (trust_sorted) {
+          int fd = open(filepath, O_RDONLY);
+          if (fd >= 0) {
+            struct stat fst = {0};
+            if (fstat(fd, &fst) == 0 && fst.st_size > 0
+                && (fst.st_size % (off_t)(sizeof(cl_ulong) * 2) == 0)) {
+              void *map = mmap(NULL, (size_t)fst.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              if (map != MAP_FAILED) {
+                unsigned int nc = (unsigned int)((size_t)fst.st_size / 16);
+                /* Sampled monotonicity check: detect obviously unsorted tables. */
+                const unsigned int NSAMPLES = 256;
+                unsigned int step = (nc > NSAMPLES) ? nc / NSAMPLES : 1;
+                unsigned int si;
+                cl_ulong prev_end = 0;
+                int sorted_ok = 1;
+                for (si = 0; si < nc; si += step) {
+                  cl_ulong e; memcpy(&e, (const unsigned char *)map + (size_t)si * 16 + 8, 8);
+                  if (e < prev_end) { sorted_ok = 0; break; }
+                  prev_end = e;
+                }
+                if (!sorted_ok) {
+                  fprintf(stderr, "[preloader] Monotonicity check FAILED for %s; falling back to full+verify\n", filepath);  fflush(stderr);
+                  munmap(map, (size_t)fst.st_size);
+                } else {
+                  madvise(map, (size_t)fst.st_size, MADV_RANDOM);
+                  acc.mode       = RT_ACCESS_MMAP_RT;
+                  acc.num_chains = nc;
+                  acc.map        = (const unsigned char *)map;
+                  acc.map_len    = (size_t)fst.st_size;
+                  acc_loaded = 1;
+                }
+              } else {
+                fprintf(stderr, "[preloader] mmap failed for %s (%s); falling back\n", filepath, strerror(errno));  fflush(stderr);
+              }
+            }
+            close(fd);
+          }
+        }
+#endif /* !_WIN32 */
 
-	is_uncompressed_table = 1;
-	start_timer(&start_time_io);    /* For loading the table only. */
-	f = fopen(filepath, "rb");
-	if (f != NULL) {
-	  long file_size = get_file_size(f);
-
-	  if ((file_size % (sizeof(cl_ulong) * 2) == 0) && (file_size > 0)) {
-	    unsigned int num_longs = file_size / sizeof(cl_ulong);
-
-	    rainbow_table = calloc(num_longs, sizeof(cl_ulong));
-	    if (rainbow_table == NULL) {
-	      fprintf(stderr, "Failed to allocate %"PRIu64" bytes for rainbow table!: %s\n", num_longs * sizeof(cl_ulong), filepath);
-	      exit(-1);
-	    }
-
-	    if (fread(rainbow_table, sizeof(cl_ulong), num_longs, f) != num_longs) {
-	      fprintf(stderr, "Error while reading rainbow table: %s\n", strerror(errno));
-	      exit(-1);
-	    }
-
-	    time_io += get_elapsed(&start_time_io);
-	    num_chains = num_longs / 2;
-	  } else {
-	    fprintf(stderr, "[preloader] Bad size (%ld) for: %s\n", file_size, filepath);  fflush(stderr);
-	    local_failed++;
-	  }
-
-	  FCLOSE(f);
-	} else {
-	  fprintf(stderr, "[preloader] fopen failed: %s (%s)\n", filepath, strerror(errno));  fflush(stderr);
-	  local_failed++;
-	}
+        if (!acc_loaded) {
+          /* Full path: calloc + fread + verify_rainbowtable — original behaviour. */
+          FILE *f = fopen(filepath, "rb");
+          if (f != NULL) {
+            long file_size = get_file_size(f);
+            if ((file_size % (long)(sizeof(cl_ulong) * 2) == 0) && (file_size > 0)) {
+              unsigned int num_longs = (unsigned int)((size_t)file_size / sizeof(cl_ulong));
+              cl_ulong *rainbow_table = calloc(num_longs, sizeof(cl_ulong));
+              if (rainbow_table == NULL) {
+                fprintf(stderr, "Failed to allocate %"PRIu64" bytes for rainbow table!: %s\n",
+                        (uint64_t)((size_t)num_longs * sizeof(cl_ulong)), filepath);
+                exit(-1);
+              }
+              if (fread(rainbow_table, sizeof(cl_ulong), num_longs, f) != num_longs) {
+                fprintf(stderr, "Error while reading rainbow table: %s\n", strerror(errno));
+                exit(-1);
+              }
+              unsigned int num_chains = num_longs / 2;
+              if (!verify_rainbowtable(rainbow_table, num_chains, VERIFY_TABLE_TYPE_LOOKUP, 0, 0, NULL)) {
+                fprintf(stderr, "\nError: %s is not a valid table suitable for lookups!  (Hint: it may not be sorted.)  Skipping...\n\n", filepath);  fflush(stderr);
+                FREE(rainbow_table);
+                local_skipped++;
+              } else {
+                acc.mode       = RT_ACCESS_FULL;
+                acc.table      = rainbow_table;
+                acc.num_chains = num_chains;
+                acc_loaded = 1;
+              }
+            } else {
+              fprintf(stderr, "[preloader] Bad size (%ld) for: %s\n", file_size, filepath);  fflush(stderr);
+              local_failed++;
+            }
+            FCLOSE(f);
+          } else {
+            fprintf(stderr, "[preloader] fopen failed: %s (%s)\n", filepath, strerror(errno));  fflush(stderr);
+            local_failed++;
+          }
+        }
       }
 
-      if (rainbow_table != NULL) {
-	unsigned int skip_table = 0;
+      time_io += get_elapsed(&start_time_io);
 
-
-	/* If the table is uncompressed (*.rt), then there's a possibility its unsorted on accident.  We will
-	 * verify them first to make sure. */
-	if (is_uncompressed_table == 1) {
-	  if (!verify_rainbowtable(rainbow_table, num_chains, VERIFY_TABLE_TYPE_LOOKUP, 0, 0, NULL)) {
-	    fprintf(stderr, "\nError: %s is not a valid table suitable for lookups!  (Hint: it may not be sorted.)  Skipping...\n\n", filepath);  fflush(stderr);
-	    FREE(rainbow_table);
-	    skip_table = 1; /* Skip further processing on this table only. */
-	    local_skipped++;
-	  }
+      if (acc_loaded) {
+	preloaded_table *pt = calloc(1, sizeof(preloaded_table));
+	if (pt == NULL) {
+	  printf("Failed to allocate memory for preload_table.\n");
+	  exit(-1);
 	}
 
-	if (!skip_table) {
-	  preloaded_table *pt = calloc(1, sizeof(preloaded_table));
-	  if (pt == NULL) {
-	    printf("Failed to allocate memory for preload_table.\n");
-	    exit(-1);
-	  }
-
-	  /* Set the file path, rainbow table, and number of chains in the newest entry of the preload list. */
-	  pt->filepath = strdup(filepath);
-	  pt->rainbow_table = rainbow_table;
-	  pt->num_chains = num_chains;
+	/* Set the file path and accessor in the newest entry of the preload list. */
+	pt->filepath = strdup(filepath);
+	pt->acc = acc;
 
 	  /* Lock the preloading system, since we're modifying shared structures. */
 	  pthread_mutex_lock(&preloaded_tables_lock);
@@ -1909,7 +2103,6 @@ void _preloading_thread(char *rt_dir) {
 	  pthread_mutex_unlock(&preloaded_tables_lock);
 	  local_tables++;
 	  tables_preloaded_count++;
-	}
       }
     } else if ((strcmp(de->d_name, ".") != 0) && (strcmp(de->d_name, "..") != 0) &&
                !str_ends_with(de->d_name, ".rt") && !str_ends_with(de->d_name, ".rtc")) {
@@ -2001,7 +2194,8 @@ void print_usage_and_exit(char *prog_name, int exit_code) {
   char *dir2 = "/home/user/";
 #endif
 
-  fprintf(stderr, "%sUsage:%s %s rainbow_table_directory ( single_hash | filename_with_many_hashes.txt | -ntlmv1 full_capture | -ntlmv1-file captures.txt ) [-gws GWS] [-disable-platform N]\n\n", WHITEB, CLR, prog_name);
+  fprintf(stderr, "%sUsage:%s %s rainbow_table_directory ( single_hash | filename_with_many_hashes.txt | -ntlmv1 full_capture | -ntlmv1-file captures.txt ) [-gws GWS] [-disable-platform N] [-trust-sorted]\n\n", WHITEB, CLR, prog_name);
+  fprintf(stderr, "    %s-trust-sorted%s    (Optional) Skip the full-table sort-verify scan for .rt files and use memory-mapped lazy I/O instead.  Only use this when tables were produced by rtsort or downloaded pre-sorted; an unsorted table will produce incorrect results.\n\n", WHITEB, CLR);
   fprintf(stderr, "    %s-gws GWS%s    (Optional) Sets the global work size for each GPU.  This can significantly affect the speed.  To tune this setting, start with multiplying the max compute units by the max work group size (both are reported on program start-up).  Then increase/decrease the value and time the results.  For example, if the max compute units is 20, and the max work group size is 1024, try using 20 x 1024 = 20480, then 20480 - 1024 = 19456, 20480 - 2048 = 18432, 2048 + 1024 = 21504, etc.  If you find a value that works better than the automatic setting, please report your findings at: https://github.com/jtesta/rainbowcrackalack/issues\n\n", WHITEB, CLR);
   fprintf(stderr, "    %s-disable-platform N%s    (Optional) Disables a platform from being used (platform numbers are reported on program start-up).  Useful when experiencing strange problems on mixed-GPU systems.  Try disabling each platform one at a time and see if the program behaves normally.\n\n\n", WHITEB, CLR);
   fprintf(stderr, "%sExamples:%s\n    %s %s 64f12cddaa88057e06a81b54e73b949b\n    %s %s %shashes_one_per_line.txt\n    %s %s %spwdump.txt\n\n", WHITEB, CLR, prog_name, dir1, prog_name, dir1, dir2, prog_name, dir1, dir2);
@@ -2010,25 +2204,25 @@ void print_usage_and_exit(char *prog_name, int exit_code) {
 
 
 /* Helper function for rt_binary_search(). */
-unsigned int _rt_binary_search(cl_ulong *rainbow_table, unsigned int low, unsigned int high, cl_ulong search_index, cl_ulong *start) {
+unsigned int _rt_binary_search(const rt_accessor *acc, unsigned int low, unsigned int high, cl_ulong search_index, cl_ulong *start) {
   unsigned int chain = 0;
 
 
   /*printf("_rt_binary_search(%u, %u, %lu)\n", low, high, search_index);*/
   if (high - low <= 8) {
     for (chain = low; chain < high; chain++) {
-      if (search_index == rainbow_table[(chain * 2) + 1]) {
-	*start = rainbow_table[chain * 2];
+      if (search_index == rt_end(acc, chain)) {
+	*start = rt_start(acc, chain);
 	/*printf("\nbinary search: found %lu at %u (between %u and %u)\n", *start, chain, low, high);*/
 	return 1;
       }
     }
   } else {
     chain = ((high - low) / 2) + low;
-    if (search_index >= rainbow_table[(chain * 2) + 1])
-      return _rt_binary_search(rainbow_table, chain, high, search_index, start);
+    if (search_index >= rt_end(acc, chain))
+      return _rt_binary_search(acc, chain, high, search_index, start);
     else
-      return _rt_binary_search(rainbow_table, low, chain, search_index, start);
+      return _rt_binary_search(acc, low, chain, search_index, start);
   }
 
   return 0;
@@ -2045,7 +2239,7 @@ void *rt_binary_search_thread(void *ptr) {
   while (ppi_cur != NULL) {
     if (ppi_cur->plaintext == NULL) {
       for (i = 0 + args->thread_number; i < ppi_cur->num_precomputed_end_indices; i += args->total_threads) {
-	if (_rt_binary_search(args->rainbow_table, 0, args->num_chains, ppi_cur->precomputed_end_indices[i], &start)) {
+	if (_rt_binary_search(args->acc, 0, args->acc->num_chains, ppi_cur->precomputed_end_indices[i], &start)) {
 	  scratch_add_match(args->scratch, ppi_idx, start, i);
 	}
       }
@@ -2063,7 +2257,7 @@ void *rt_binary_search_thread(void *ptr) {
  * precomputed end indices.  If/when matches are found, the corresponding start indices
  * are added to the precomputed_and_potential_indices's potential_start_indices
  * array. */
-void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precomputed_and_potential_indices *ppi_head, unsigned int num_threads, worker_scratch *scratch) {
+void rt_binary_search(const rt_accessor *acc, precomputed_and_potential_indices *ppi_head, unsigned int num_threads, worker_scratch *scratch) {
   struct timespec start_time_searching = {0};
   char time_searching_str[64] = {0};
   pthread_t *threads = NULL;
@@ -2083,8 +2277,7 @@ void rt_binary_search(cl_ulong *rainbow_table, unsigned int num_chains, precompu
   for (i = 0; i < num_threads; i++) {
     args[i].thread_number = i;
     args[i].total_threads = num_threads;
-    args[i].rainbow_table = rainbow_table;
-    args[i].num_chains = num_chains;
+    args[i].acc = acc;
     args[i].ppi_head = ppi_head;
     args[i].scratch = scratch;
 
@@ -2337,11 +2530,13 @@ void *table_worker_thread(void *ptr) {
 
   while (1) {
     preloaded_table *pt = NULL;
-    cl_ulong *rainbow_table = NULL;
+    rt_accessor acc;
     unsigned int num_chains = 0;
     unsigned int dev_slot = 0;
     thread_args fa_args;
     int flush_fa = 0;
+
+    memset(&acc, 0, sizeof(acc));
 
     pthread_mutex_lock(&stats_mutex);
     if (all_cracked) {
@@ -2357,15 +2552,15 @@ void *table_worker_thread(void *ptr) {
       /* No more tables; flush any accumulated BS results. */
       flush_fa = (tables_in_scratch > 0);
     } else {
-      rainbow_table = pt->rainbow_table;
-      num_chains = pt->num_chains;
+      acc = pt->acc;                  /* copy accessor (owns map/heap ptr) */
+      num_chains = acc.num_chains;
       printf("  [worker %u] Processing: %s\n", wargs->worker_id, pt->filepath);  fflush(stdout);
       FREE(pt->filepath);
       FREE(pt);  /* pt is now NULL — that is fine; no_more_tables is already captured */
 
       /* Accumulate BS results into scratch without clearing between tables. */
-      rt_binary_search(rainbow_table, num_chains, wargs->ppi_head, wargs->bs_threads, scratch);
-      FREE(rainbow_table);
+      rt_binary_search(&acc, wargs->ppi_head, wargs->bs_threads, scratch);
+      free_rt_accessor(&acc);   /* munmap or FREE(heap) */
       tables_in_scratch++;
 
       /* Update chain/table stats immediately so ETA is current. */
@@ -2502,7 +2697,7 @@ void search_tables(unsigned int total_tables, precomputed_and_potential_indices 
   while (preloaded_table_list != NULL) {
     preloaded_table *pt_next = preloaded_table_list->next;
     FREE(preloaded_table_list->filepath);
-    FREE(preloaded_table_list->rainbow_table);
+    free_rt_accessor(&preloaded_table_list->acc);
     FREE(preloaded_table_list);
     preloaded_table_list = pt_next;
   }
@@ -2548,6 +2743,8 @@ int main(int ac, char **av) {
       ntlmv1_batch_mode = 1;
       if ((int)(i + 1) < ac)
         ntlmv1_file_arg = av[++i];
+    } else if (strcmp(av[i], "-trust-sorted") == 0) {
+      trust_sorted = 1;
     } else if (strcmp(av[i], "-gws") == 0) {
       if ((int)(i + 1) < ac)
         user_provided_gws = (unsigned int)atoi(av[++i]);

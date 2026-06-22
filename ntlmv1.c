@@ -108,7 +108,7 @@ int ntlmv1_recover_last2(const unsigned char block3[8], unsigned char last2[2],
   for (v = 0; v < 65536; v++) {
     cand[0] = (unsigned char)((v >> 8) & 0xff);
     cand[1] = (unsigned char)(v & 0xff);
-    netntlmv1_hash(cand, 7, h);
+    netntlmv1_hash_nocheck(cand, h);
     if (memcmp(h, block3, 8) == 0) {
       if (*found_count == 0) {
         last2[0] = cand[0];

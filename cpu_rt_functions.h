@@ -20,4 +20,6 @@ void setup_des_key(char key_56[], unsigned char *key);
 
 void netntlmv1_hash(unsigned char *plaintext, unsigned int plaintext_len, unsigned char *hash);
 
+void netntlmv1_hash_nocheck(const unsigned char *cand7, unsigned char *out8);
+
 #endif

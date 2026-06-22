@@ -117,12 +117,19 @@ uint64_t generate_rainbow_chain(
   unsigned int pos = 0;
 
 
-  if (hash_type != HASH_NTLM)
-    fprintf(stderr, "\n\tWARNING: only NTLM hashes are currently supported!\n\n");
+  if ((hash_type != HASH_NTLM) && (hash_type != HASH_NETNTLMV1))
+    fprintf(stderr, "\n\tWARNING: only NTLM and NetNTLMv1 hashes are currently supported!\n\n");
+
+  /* NetNTLMv1 uses 8-byte DES hashes; NTLM uses 16-byte MD4 hashes. */
+  if (hash_type == HASH_NETNTLMV1)
+    *hash_len = 8;
 
   for (; pos < chain_len - 1; pos++) {
     index_to_plaintext(index, charset, charset_len, plaintext_len_min, plaintext_len_max, plaintext_space_up_to_index, plaintext, plaintext_len);
-    ntlm_hash(plaintext, *plaintext_len, hash);
+    if (hash_type == HASH_NETNTLMV1)
+      netntlmv1_hash_nocheck((const unsigned char *)plaintext, hash);
+    else
+      ntlm_hash(plaintext, *plaintext_len, hash);
     index = hash_to_index(hash, *hash_len, reduction_offset, plaintext_space_total, pos);
   }
   return index;

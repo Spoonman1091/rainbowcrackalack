@@ -327,6 +327,12 @@ void netntlmv1_hash(unsigned char *plaintext, unsigned int plaintext_len, unsign
         return;
     }
 
+    // Allow weak DES keys (e.g., all-zero key from last2=[0,0] in block3 brute-force).
+    // Without this, gcry_cipher_setkey returns GPG_ERR_WEAK_KEY and wipes the key
+    // schedule, causing ntlmv1_recover_last2 to miss captures whose last2 bytes
+    // expand to a DES weak key.
+    gcry_cipher_ctl(handle, GCRYCTL_SET_ALLOW_WEAK_KEY, NULL, 0);
+
     // Set the expanded 8-byte DES key
     err = gcry_cipher_setkey(handle, des_key, KEY_SIZE);
     if (err) {

@@ -448,7 +448,7 @@ void check_false_alarms(precomputed_and_potential_indices *ppi, thread_args *arg
     charset_len = 256;
   }
   else {
-    charset_len = strlen(args->charset) + 1;
+    charset_len = strlen(args->charset);
   }
 
   plaintext_space_total = fill_plaintext_space_table(charset_len, args->plaintext_len_min, args->plaintext_len_max, plaintext_space_up_to_index);
@@ -606,7 +606,7 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
   if (strcmp(fa_args->charset_name, "byte") == 0)
     charset_len = 256;
   else
-    charset_len = strlen(fa_args->charset) + 1;
+    charset_len = strlen(fa_args->charset);
 
   plaintext_space_total = fill_plaintext_space_table(charset_len, fa_args->plaintext_len_min, fa_args->plaintext_len_max, plaintext_space_up_to_index);
 
@@ -963,7 +963,7 @@ void *host_thread_false_alarm(void *ptr) {
     charset_len = 256;
   }
   else {
-    charset_len = strlen(args->charset) + 1;
+    charset_len = strlen(args->charset);
   }
 
   plaintext_space_total = fill_plaintext_space_table(charset_len, args->plaintext_len_min, args->plaintext_len_max, plaintext_space_up_to_index);
@@ -1072,7 +1072,7 @@ void *host_thread_false_alarm(void *ptr) {
   }
 
   CLCREATEARG(0, hash_type_buffer, CL_RO, args->hash_type, sizeof(cl_uint));
-  CLCREATEARG_ARRAY(1, charset_buffer, CL_RO, args->charset, charset_len);
+  CLCREATEARG_ARRAY(1, charset_buffer, CL_RO, args->charset, charset_len + 1);
   CLCREATEARG(2, plaintext_len_min_buffer, CL_RO, args->plaintext_len_min, sizeof(cl_uint));
   CLCREATEARG(3, plaintext_len_max_buffer, CL_RO, args->plaintext_len_max, sizeof(cl_uint));
   CLCREATEARG(4, reduction_offset_buffer, CL_RO, args->reduction_offset, sizeof(cl_uint));
@@ -1234,7 +1234,7 @@ static size_t autotune_precompute_gws(thread_args *args) {
   }
 
   charset_len = (strcmp(args->charset_name, "byte") == 0) ?
-                256 : (unsigned int)(strlen(args->charset) + 1);
+                256 : (unsigned int)strlen(args->charset);
   /* Use a short chain length for benchmarking — relative GWS throughput is
    * independent of chain depth, so 200 steps is enough while keeping each
    * kernel launch under a millisecond instead of seconds. */
@@ -1243,7 +1243,7 @@ static size_t autotune_precompute_gws(thread_args *args) {
   CLCREATEARG(0, hash_type_buffer, CL_RO, args->hash_type, sizeof(cl_uint));
   CLCREATEARG_ARRAY(1, hash_buffer, CL_RO, hash_binary, hash_binary_len);
   CLCREATEARG(2, hash_len_buffer, CL_RO, hash_binary_len, sizeof(cl_uint));
-  CLCREATEARG_ARRAY(3, charset_buffer, CL_RO, args->charset, charset_len);
+  CLCREATEARG_ARRAY(3, charset_buffer, CL_RO, args->charset, charset_len + 1);
   CLCREATEARG(4, plen_min_buffer, CL_RO, args->plaintext_len_min, sizeof(cl_uint));
   CLCREATEARG(5, plen_max_buffer, CL_RO, args->plaintext_len_max, sizeof(cl_uint));
   CLCREATEARG(6, table_index_buffer, CL_RO, args->table_index, sizeof(cl_uint));
@@ -1446,14 +1446,14 @@ void *host_thread_precompute(void *ptr) {
     charset_len = 256;
   }
   else {
-    charset_len = strlen(args->charset) + 1;
+    charset_len = strlen(args->charset);
   }
 
 
   CLCREATEARG(0, hash_type_buffer, CL_RO, args->hash_type, sizeof(cl_uint));
   CLCREATEARG_ARRAY(1, hash_buffer, CL_RO, hash_binary, hash_binary_len);
   CLCREATEARG(2, hash_len_buffer, CL_RO, hash_binary_len, sizeof(cl_uint));
-  CLCREATEARG_ARRAY(3, charset_buffer, CL_RO, args->charset, charset_len);
+  CLCREATEARG_ARRAY(3, charset_buffer, CL_RO, args->charset, charset_len + 1);
   CLCREATEARG(4, plaintext_len_min_buffer, CL_RO, args->plaintext_len_min, sizeof(cl_uint));
   CLCREATEARG(5, plaintext_len_max_buffer, CL_RO, args->plaintext_len_max, sizeof(cl_uint));
   CLCREATEARG(6, table_index_buffer, CL_RO, args->table_index, sizeof(cl_uint));

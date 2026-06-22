@@ -1980,28 +1980,15 @@ void _preloading_thread(char *rt_dir) {
               void *map = mmap(NULL, (size_t)fst.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
               if (map != MAP_FAILED) {
                 unsigned int nc = (unsigned int)((size_t)fst.st_size / 16);
-                /* Sampled monotonicity check: detect obviously unsorted tables. */
-                const unsigned int NSAMPLES = 256;
-                unsigned int step = (nc > NSAMPLES) ? nc / NSAMPLES : 1;
-                unsigned int si;
-                cl_ulong prev_end = 0;
-                int sorted_ok = 1;
-                for (si = 0; si < nc; si += step) {
-                  cl_ulong e; memcpy(&e, (const unsigned char *)map + (size_t)si * 16 + 8, 8);
-                  if (e < prev_end) { sorted_ok = 0; break; }
-                  prev_end = e;
-                }
-                if (!sorted_ok) {
-                  fprintf(stderr, "[preloader] Monotonicity check FAILED for %s; falling back to full+verify\n", filepath);  fflush(stderr);
-                  munmap(map, (size_t)fst.st_size);
-                } else {
-                  madvise(map, (size_t)fst.st_size, MADV_RANDOM);
-                  acc.mode       = RT_ACCESS_MMAP_RT;
-                  acc.num_chains = nc;
-                  acc.map        = (const unsigned char *)map;
-                  acc.map_len    = (size_t)fst.st_size;
-                  acc_loaded = 1;
-                }
+                /* -trust-sorted means the caller asserts sortedness; skip the
+                 * sampled monotonicity check (256 random seeks × 4096 tables
+                 * on spinning disk was ~2.5 s/table — the new bottleneck). */
+                madvise(map, (size_t)fst.st_size, MADV_RANDOM);
+                acc.mode       = RT_ACCESS_MMAP_RT;
+                acc.num_chains = nc;
+                acc.map        = (const unsigned char *)map;
+                acc.map_len    = (size_t)fst.st_size;
+                acc_loaded = 1;
               } else {
                 fprintf(stderr, "[preloader] mmap failed for %s (%s); falling back\n", filepath, strerror(errno));  fflush(stderr);
               }

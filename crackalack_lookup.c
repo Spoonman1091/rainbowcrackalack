@@ -319,6 +319,8 @@ unsigned int stop_preloading = 0;
 
 int ntlmv1_mode = 0;
 char *ntlmv1_capture_arg = NULL;
+int ntlmv1_batch_mode = 0;
+char *ntlmv1_file_arg = NULL;
 
 /* Running count of tables successfully added to the preload buffer; used for
  * diagnostic logging only. */
@@ -2007,7 +2009,7 @@ void print_usage_and_exit(char *prog_name, int exit_code) {
   char *dir2 = "/home/user/";
 #endif
 
-  fprintf(stderr, "%sUsage:%s %s rainbow_table_directory ( single_hash | filename_with_many_hashes.txt | -ntlmv1 full_capture ) [-gws GWS] [-disable-platform N]\n\n", WHITEB, CLR, prog_name);
+  fprintf(stderr, "%sUsage:%s %s rainbow_table_directory ( single_hash | filename_with_many_hashes.txt | -ntlmv1 full_capture | -ntlmv1-file captures.txt ) [-gws GWS] [-disable-platform N]\n\n", WHITEB, CLR, prog_name);
   fprintf(stderr, "    %s-gws GWS%s    (Optional) Sets the global work size for each GPU.  This can significantly affect the speed.  To tune this setting, start with multiplying the max compute units by the max work group size (both are reported on program start-up).  Then increase/decrease the value and time the results.  For example, if the max compute units is 20, and the max work group size is 1024, try using 20 x 1024 = 20480, then 20480 - 1024 = 19456, 20480 - 2048 = 18432, 2048 + 1024 = 21504, etc.  If you find a value that works better than the automatic setting, please report your findings at: https://github.com/jtesta/rainbowcrackalack/issues\n\n", WHITEB, CLR);
   fprintf(stderr, "    %s-disable-platform N%s    (Optional) Disables a platform from being used (platform numbers are reported on program start-up).  Useful when experiencing strange problems on mixed-GPU systems.  Try disabling each platform one at a time and see if the program behaves normally.\n\n\n", WHITEB, CLR);
   fprintf(stderr, "%sExamples:%s\n    %s %s 64f12cddaa88057e06a81b54e73b949b\n    %s %s %shashes_one_per_line.txt\n    %s %s %spwdump.txt\n\n", WHITEB, CLR, prog_name, dir1, prog_name, dir1, dir2, prog_name, dir1, dir2);
@@ -2536,6 +2538,8 @@ int main(int ac, char **av) {
   pthread_t preload_thread_id = {0};
   preloading_thread_args preload_thread_args = {0};
   ntlmv1_capture parsed_capture = {0};
+  ntlmv1_capture *captures = NULL;
+  unsigned int num_captures = 0, num_skipped = 0;
 
 
   ENABLE_CONSOLE_COLOR();
@@ -2547,6 +2551,11 @@ int main(int ac, char **av) {
       ntlmv1_mode = 1;
       if ((int)(i + 1) < ac)
         ntlmv1_capture_arg = av[++i];
+    } else if (strcmp(av[i], "-ntlmv1-file") == 0) {
+      ntlmv1_mode = 1;
+      ntlmv1_batch_mode = 1;
+      if ((int)(i + 1) < ac)
+        ntlmv1_file_arg = av[++i];
     } else if (strcmp(av[i], "-gws") == 0) {
       if ((int)(i + 1) < ac)
         user_provided_gws = (unsigned int)atoi(av[++i]);
@@ -2557,8 +2566,13 @@ int main(int ac, char **av) {
   }
 
   if (ntlmv1_mode) {
-    if (ac < 4 || ntlmv1_capture_arg == NULL)
-      print_usage_and_exit(av[0], -1);
+    if (ntlmv1_batch_mode) {
+      if (ac < 4 || ntlmv1_file_arg == NULL)
+        print_usage_and_exit(av[0], -1);
+    } else {
+      if (ac < 4 || ntlmv1_capture_arg == NULL)
+        print_usage_and_exit(av[0], -1);
+    }
   } else {
     if ((ac < 3) || (ac > 5))
       print_usage_and_exit(av[0], -1);
@@ -2567,7 +2581,7 @@ int main(int ac, char **av) {
   }
 
   /* In ntlmv1 mode, validate the capture before any GPU work. */
-  if (ntlmv1_mode) {
+  if (ntlmv1_mode && !ntlmv1_batch_mode) {
     int parse_ret = ntlmv1_parse_capture(ntlmv1_capture_arg, &parsed_capture);
     if (parse_ret == NTLMV1_ERR_FORMAT) {
       fprintf(stderr, "Error: invalid NTLMv1 capture format.\n  Expected: user::domain:LMresp48hex:NTresp48hex:challenge16hex\n");
@@ -2842,17 +2856,143 @@ int main(int ac, char **av) {
     hashes[0] = strdup(single_hash);
     num_hashes = 1;
   }
-  } else { /* ntlmv1 mode: inject two block hashes */
-    usernames = calloc(2, sizeof(char *));
-    hashes = calloc(2, sizeof(char *));
-    if ((usernames == NULL) || (hashes == NULL)) {
-      fprintf(stderr, "Error while allocating buffer for hashes.\n");
-      goto err;
+  } else { /* ntlmv1 mode: inject block hashes */
+    if (!ntlmv1_batch_mode) {
+      /* Single capture: inject two block hashes directly. */
+      usernames = calloc(2, sizeof(char *));
+      hashes = calloc(2, sizeof(char *));
+      if ((usernames == NULL) || (hashes == NULL)) {
+        fprintf(stderr, "Error while allocating buffer for hashes.\n");
+        goto err;
+      }
+      usernames[0] = usernames[1] = NULL;
+      hashes[0] = strdup(parsed_capture.block1_hex);
+      hashes[1] = strdup(parsed_capture.block2_hex);
+      num_hashes = 2;
+    } else {
+      /* Batch mode: read captures file, parse lines, dedup-insert block hashes. */
+      FILE *batch_f = NULL;
+      char *batch_file_data = NULL;
+      unsigned long batch_file_size = 0;
+      unsigned long k = 0;
+      char *line = NULL;
+      unsigned int max_lines = 0, h = 0, ln = 0;
+
+      batch_f = fopen(ntlmv1_file_arg, "rb");
+      if (batch_f == NULL) {
+        fprintf(stderr, "Error: could not open captures file: %s\n", ntlmv1_file_arg);
+        goto err;
+      }
+      batch_file_size = get_file_size(batch_f);
+      if (batch_file_size == 0) {
+        fprintf(stderr, "Error: captures file is empty: %s\n", ntlmv1_file_arg);
+        fclose(batch_f);
+        goto err;
+      }
+      batch_file_data = calloc(batch_file_size + 1, 1);
+      if (batch_file_data == NULL) {
+        fprintf(stderr, "Error: could not allocate buffer for captures file.\n");
+        fclose(batch_f);
+        goto err;
+      }
+      if (fread(batch_file_data, 1, batch_file_size, batch_f) != batch_file_size) {
+        fprintf(stderr, "Error: could not read captures file: %s\n", ntlmv1_file_arg);
+        fclose(batch_f);
+        FREE(batch_file_data);
+        goto err;
+      }
+      fclose(batch_f);
+      batch_file_data[batch_file_size] = '\0';
+
+      /* Count newlines to bound the array sizes. */
+      for (k = 0; k < batch_file_size; k++) {
+        if (batch_file_data[k] == '\n')
+          max_lines++;
+      }
+      max_lines++;  /* account for final line with no trailing newline */
+
+      captures = calloc(max_lines, sizeof(ntlmv1_capture));
+      usernames = calloc(max_lines * 2, sizeof(char *));
+      hashes = calloc(max_lines * 2, sizeof(char *));
+      if ((captures == NULL) || (usernames == NULL) || (hashes == NULL)) {
+        fprintf(stderr, "Error while allocating buffer for batch captures.\n");
+        FREE(batch_file_data);
+        goto err;
+      }
+
+      /* Parse each line and dedup-insert block hashes. */
+      line = strtok(batch_file_data, "\n");
+      while (line != NULL) {
+        ntlmv1_capture tmp = {0};
+        unsigned int llen = (unsigned int)strlen(line);
+        int ret = 0;
+
+        ln++;
+
+        /* Trim trailing carriage return. */
+        if (llen > 0 && line[llen - 1] == '\r')
+          line[--llen] = '\0';
+
+        if (llen == 0) {
+          line = strtok(NULL, "\n");
+          continue;
+        }
+
+        ret = ntlmv1_parse_capture(line, &tmp);
+        if (ret != NTLMV1_OK) {
+          if (ret == NTLMV1_ERR_ESS)
+            printf("  Line %u: skipped (ESS/NTLMv1-SSP): %s\n", ln, line);
+          else if (ret == NTLMV1_ERR_CHALLENGE)
+            printf("  Line %u: skipped (challenge != 1122334455667788): %s\n", ln, line);
+          else
+            printf("  Line %u: skipped (bad format): %s\n", ln, line);
+          num_skipped++;
+          line = strtok(NULL, "\n");
+          continue;
+        }
+
+        captures[num_captures++] = tmp;  /* struct copy */
+
+        /* Dedup-insert block1_hex. */
+        for (h = 0; h < num_hashes; h++) {
+          if (strcmp(hashes[h], tmp.block1_hex) == 0)
+            break;
+        }
+        if (h == num_hashes) {
+          hashes[num_hashes] = strdup(tmp.block1_hex);
+          usernames[num_hashes] = NULL;
+          num_hashes++;
+        }
+
+        /* Dedup-insert block2_hex. */
+        for (h = 0; h < num_hashes; h++) {
+          if (strcmp(hashes[h], tmp.block2_hex) == 0)
+            break;
+        }
+        if (h == num_hashes) {
+          hashes[num_hashes] = strdup(tmp.block2_hex);
+          usernames[num_hashes] = NULL;
+          num_hashes++;
+        }
+
+        line = strtok(NULL, "\n");
+      }
+
+      FREE(batch_file_data);
+
+      if (num_captures == 0) {
+        printf("No valid NTLMv1 captures found in %s (%u line(s) skipped).\n", ntlmv1_file_arg, num_skipped);
+        free_loaded_hashes(usernames, hashes);
+        FREE(captures);
+        FREE(args);
+        pthread_barrier_destroy(&barrier);
+        return 0;
+      }
+
+      printf("Loaded %u capture(s) from %s (%u skipped); %u unique block hash(es) to precompute.\n",
+             num_captures, ntlmv1_file_arg, num_skipped, num_hashes);
+      fflush(stdout);
     }
-    usernames[0] = usernames[1] = NULL;
-    hashes[0] = strdup(parsed_capture.block1_hex);
-    hashes[1] = strdup(parsed_capture.block2_hex);
-    num_hashes = 2;
   }
 
   /* We're done checking the pot file for previously-cracked hashes. */
@@ -2986,70 +3126,148 @@ int main(int ac, char **av) {
 
   /* NTLMv1 reassembly: match recovered block keys and assemble the full NT hash. */
   if (ntlmv1_mode) {
-    unsigned char k1[7] = {0}, k2[7] = {0};
-    int k1_found = 0, k2_found = 0;
-    int same_block = (strcmp(parsed_capture.block1_hex, parsed_capture.block2_hex) == 0);
+    if (!ntlmv1_batch_mode) {
+      /* Single capture reassembly. */
+      unsigned char k1[7] = {0}, k2[7] = {0};
+      int k1_found = 0, k2_found = 0;
+      int same_block = (strcmp(parsed_capture.block1_hex, parsed_capture.block2_hex) == 0);
 
-    ppi_cur = ppi_head;
-    while (ppi_cur != NULL) {
-      if (ppi_cur->cracked_key_len > 0) {
-        if (strcmp(ppi_cur->hash, parsed_capture.block1_hex) == 0) {
-          memcpy(k1, ppi_cur->cracked_key, 7);
-          k1_found = 1;
-          if (same_block) {
+      ppi_cur = ppi_head;
+      while (ppi_cur != NULL) {
+        if (ppi_cur->cracked_key_len > 0) {
+          if (strcmp(ppi_cur->hash, parsed_capture.block1_hex) == 0) {
+            memcpy(k1, ppi_cur->cracked_key, 7);
+            k1_found = 1;
+            if (same_block) {
+              memcpy(k2, ppi_cur->cracked_key, 7);
+              k2_found = 1;
+            }
+          }
+          if (!same_block && strcmp(ppi_cur->hash, parsed_capture.block2_hex) == 0) {
             memcpy(k2, ppi_cur->cracked_key, 7);
             k2_found = 1;
           }
         }
-        if (!same_block && strcmp(ppi_cur->hash, parsed_capture.block2_hex) == 0) {
-          memcpy(k2, ppi_cur->cracked_key, 7);
-          k2_found = 1;
+        ppi_cur = ppi_cur->next;
+      }
+
+      if (!k1_found || !k2_found) {
+        printf("\nPartial NTLMv1 crack:\n");
+        if (k1_found) {
+          char hex[15] = {0};
+          bytes_to_hex(k1, 7, hex, sizeof(hex));
+          printf("  Block 1 (%s): %s\n", parsed_capture.block1_hex, hex);
+        } else {
+          printf("  Block 1 (%s): NOT FOUND in tables\n", parsed_capture.block1_hex);
+        }
+        if (k2_found) {
+          char hex[15] = {0};
+          bytes_to_hex(k2, 7, hex, sizeof(hex));
+          printf("  Block 2 (%s): %s\n", parsed_capture.block2_hex, hex);
+        } else {
+          printf("  Block 2 (%s): NOT FOUND in tables\n", parsed_capture.block2_hex);
+        }
+        printf("  Full NT hash cannot be assembled.\n");
+      } else {
+        unsigned char last2[2] = {0};
+        unsigned int found_count = 0;
+        int ok = ntlmv1_recover_last2(parsed_capture.block3, last2, &found_count);
+        if (!ok || found_count == 0) {
+          printf("\nCould not brute-force block3; capture may be malformed.\n");
+        } else {
+          unsigned char ntlm16[16] = {0};
+          char ntlm_hex[33] = {0};
+
+          if (found_count > 1)
+            printf("\nWarning: block3 brute-force produced %u collisions; using first match.\n", found_count);
+
+          ntlmv1_assemble(k1, k2, last2, ntlm16);
+          bytes_to_hex(ntlm16, 16, ntlm_hex, sizeof(ntlm_hex));
+
+          printf("\n%sRecovered NT hash: %s%s\n", GREENB, ntlm_hex, CLR);
+          printf("%s%s:::%s:::%s\n", GREENB, parsed_capture.username, ntlm_hex, CLR);
+          fflush(stdout);
         }
       }
-      ppi_cur = ppi_cur->next;
-    }
-
-    if (!k1_found || !k2_found) {
-      printf("\nPartial NTLMv1 crack:\n");
-      if (k1_found) {
-        char hex[15] = {0};
-        bytes_to_hex(k1, 7, hex, sizeof(hex));
-        printf("  Block 1 (%s): %s\n", parsed_capture.block1_hex, hex);
-      } else {
-        printf("  Block 1 (%s): NOT FOUND in tables\n", parsed_capture.block1_hex);
-      }
-      if (k2_found) {
-        char hex[15] = {0};
-        bytes_to_hex(k2, 7, hex, sizeof(hex));
-        printf("  Block 2 (%s): %s\n", parsed_capture.block2_hex, hex);
-      } else {
-        printf("  Block 2 (%s): NOT FOUND in tables\n", parsed_capture.block2_hex);
-      }
-      printf("  Full NT hash cannot be assembled.\n");
     } else {
-      unsigned char last2[2] = {0};
-      unsigned int found_count = 0;
-      int ok = ntlmv1_recover_last2(parsed_capture.block3, last2, &found_count);
-      if (!ok || found_count == 0) {
-        printf("\nCould not brute-force block3; capture may be malformed.\n");
-      } else {
-        unsigned char ntlm16[16] = {0};
-        char ntlm_hex[33] = {0};
+      /* Batch mode: iterate over all captures. */
+      unsigned int batch_cracked = 0, batch_partial = 0, batch_failed = 0;
+      unsigned int c = 0;
 
-        if (found_count > 1)
-          printf("\nWarning: block3 brute-force produced %u collisions; using first match.\n", found_count);
+      for (c = 0; c < num_captures; c++) {
+        unsigned char k1[7] = {0}, k2[7] = {0};
+        int k1_found = 0, k2_found = 0;
+        int same_block = (strcmp(captures[c].block1_hex, captures[c].block2_hex) == 0);
 
-        ntlmv1_assemble(k1, k2, last2, ntlm16);
-        bytes_to_hex(ntlm16, 16, ntlm_hex, sizeof(ntlm_hex));
+        ppi_cur = ppi_head;
+        while (ppi_cur != NULL) {
+          if (ppi_cur->cracked_key_len > 0) {
+            if (strcmp(ppi_cur->hash, captures[c].block1_hex) == 0) {
+              memcpy(k1, ppi_cur->cracked_key, 7);
+              k1_found = 1;
+              if (same_block) {
+                memcpy(k2, ppi_cur->cracked_key, 7);
+                k2_found = 1;
+              }
+            }
+            if (!same_block && strcmp(ppi_cur->hash, captures[c].block2_hex) == 0) {
+              memcpy(k2, ppi_cur->cracked_key, 7);
+              k2_found = 1;
+            }
+          }
+          ppi_cur = ppi_cur->next;
+        }
 
-        printf("\n%sRecovered NT hash: %s%s\n", GREENB, ntlm_hex, CLR);
-        printf("%s%s:::%s:::%s\n", GREENB, parsed_capture.username, ntlm_hex, CLR);
-        fflush(stdout);
+        if (!k1_found || !k2_found) {
+          printf("\n[%s] Partial NTLMv1 crack:\n", captures[c].username);
+          if (k1_found) {
+            char hex[15] = {0};
+            bytes_to_hex(k1, 7, hex, sizeof(hex));
+            printf("  Block 1 (%s): %s\n", captures[c].block1_hex, hex);
+          } else {
+            printf("  Block 1 (%s): NOT FOUND in tables\n", captures[c].block1_hex);
+          }
+          if (k2_found) {
+            char hex[15] = {0};
+            bytes_to_hex(k2, 7, hex, sizeof(hex));
+            printf("  Block 2 (%s): %s\n", captures[c].block2_hex, hex);
+          } else {
+            printf("  Block 2 (%s): NOT FOUND in tables\n", captures[c].block2_hex);
+          }
+          printf("  Full NT hash cannot be assembled.\n");
+          batch_partial++;
+        } else {
+          unsigned char last2[2] = {0};
+          unsigned int found_count = 0;
+          int ok = ntlmv1_recover_last2(captures[c].block3, last2, &found_count);
+          if (!ok || found_count == 0) {
+            printf("\n[%s] Could not brute-force block3; capture may be malformed.\n", captures[c].username);
+            batch_failed++;
+          } else {
+            unsigned char ntlm16[16] = {0};
+            char ntlm_hex[33] = {0};
+
+            if (found_count > 1)
+              printf("\nWarning: block3 brute-force produced %u collisions; using first match.\n", found_count);
+
+            ntlmv1_assemble(k1, k2, last2, ntlm16);
+            bytes_to_hex(ntlm16, 16, ntlm_hex, sizeof(ntlm_hex));
+
+            printf("\n%sRecovered NT hash: %s%s\n", GREENB, ntlm_hex, CLR);
+            printf("%s%s:::%s:::%s\n", GREENB, captures[c].username, ntlm_hex, CLR);
+            fflush(stdout);
+            batch_cracked++;
+          }
+        }
       }
+
+      printf("\nNTLMv1 batch summary: %u cracked, %u partial, %u malformed-block3, %u skipped (of %u lines).\n",
+             batch_cracked, batch_partial, batch_failed, num_skipped, num_captures + num_skipped);
     }
 
     free_precomputed_and_potential_indices(&ppi_head);
     free_loaded_hashes(usernames, hashes);
+    FREE(captures);
     FREE(args);
     pthread_barrier_destroy(&barrier);
     return 0;
@@ -3107,6 +3325,7 @@ int main(int ac, char **av) {
   FREE(file_data);
   free_precomputed_and_potential_indices(&ppi_head);
   free_loaded_hashes(usernames, hashes);
+  FREE(captures);
   FREE(args);
   pthread_barrier_destroy(&barrier);
   return -1;

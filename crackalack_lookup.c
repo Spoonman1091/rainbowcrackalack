@@ -677,7 +677,6 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
     if (fa_args->results[j] != 0) {
       char plaintext[MAX_PLAINTEXT_LEN] = {0};
       unsigned int plaintext_len = 0;
-      unsigned char real_key[8] = {0};
 
       index_to_plaintext(fa_args->results[j], fa_args->charset, charset_len, fa_args->plaintext_len_min, fa_args->plaintext_len_max, plaintext_space_up_to_index, plaintext, &plaintext_len);
 
@@ -690,12 +689,9 @@ void check_false_alarms_worker(precomputed_and_potential_indices *ppi_head, work
       } else if (fa_args->hash_type == HASH_NETNTLMV1) {
         unsigned char hash[8] = {0};
         char hash_hex[(sizeof(hash) * 2) + 1] = {0};
-        char rkey_hex[(sizeof(hash) * 2) + 1] = {0};
-        setup_des_key(plaintext, real_key);
-        netntlmv1_hash(real_key, 8, hash);
+        netntlmv1_hash((unsigned char *)plaintext, plaintext_len, hash);
         if (!bytes_to_hex(hash, sizeof(hash), hash_hex, sizeof(hash_hex)) || (strncmp(hash_hex, ppi_refs[j]->hash, 16) != 0)) {
-          bytes_to_hex(real_key, sizeof(real_key), rkey_hex, sizeof(rkey_hex));
-          printf("Found super false positive!: (Net-NTLMv1('%s') == %s) != %s\n", rkey_hex, hash_hex, ppi_refs[j]->hash);
+          printf("Found super false positive!: (Net-NTLMv1('%s') == %s) != %s\n", plaintext, hash_hex, ppi_refs[j]->hash);
           continue;
         }
       } else {

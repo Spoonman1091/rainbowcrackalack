@@ -620,14 +620,14 @@ void netntlmv1_hash_nocheck(const unsigned char *cand7, unsigned char *out8)
   NC_ROUND(Y, X); NC_ROUND(X, Y);
 #undef NC_ROUND
 
-  /* Final permutation (inverse IP). */
-  X = ((X << 31) | (X >>  1));
-  T = (X ^ Y) & 0xAAAAAAAAu; X ^= T; Y ^= T;
+  /* Final permutation: DES_FP(Y,X) — Y is the first macro argument, rotated first. */
   Y = ((Y << 31) | (Y >>  1));
-  T = ((Y >>  8) ^ X) & 0x00FF00FFu; X ^= T; Y ^= (T <<  8);
-  T = ((Y >>  2) ^ X) & 0x33333333u; X ^= T; Y ^= (T <<  2);
-  T = ((X >> 16) ^ Y) & 0x0000FFFFu; Y ^= T; X ^= (T << 16);
-  T = ((X >>  4) ^ Y) & 0x0F0F0F0Fu; Y ^= T; X ^= (T <<  4);
+  T = (Y ^ X) & 0xAAAAAAAAu; Y ^= T; X ^= T;
+  X = ((X << 31) | (X >>  1));
+  T = ((X >>  8) ^ Y) & 0x00FF00FFu; Y ^= T; X ^= (T <<  8);
+  T = ((X >>  2) ^ Y) & 0x33333333u; Y ^= T; X ^= (T <<  2);
+  T = ((Y >> 16) ^ X) & 0x0000FFFFu; X ^= T; Y ^= (T << 16);
+  T = ((Y >>  4) ^ X) & 0x0F0F0F0Fu; X ^= T; Y ^= (T <<  4);
 
   out8[0] = (unsigned char)(Y >> 24); out8[1] = (unsigned char)(Y >> 16);
   out8[2] = (unsigned char)(Y >>  8); out8[3] = (unsigned char)(Y      );
